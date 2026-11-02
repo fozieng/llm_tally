@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.18.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "django-llm-tally"
+version = "0.1.0"
+description = "Zero-dependency LLM helper for Python & Django with self-evicting in-memory caching, smart 5xx/network retries, per-feature cost tracking, and an interactive HTML dashboard."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Fauzi Azzam" }
+]
+keywords = [
+    "llm",
+    "django",
+    "ai",
+    "cache",
+    "retry",
+    "cost-tracking",
+    "openai",
+    "anthropic",
+    "gemini",
+    "observability",
+    "dashboard",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+django = ["Django>=4.2"]
+dev = [
+    "pytest>=7.4.0",
+    "build>=1.0.0",
+    "twine>=5.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/fauziazzam/django-llm-tally"
+Repository = "https://github.com/fauziazzam/django-llm-tally"
+Issues = "https://github.com/fauziazzam/django-llm-tally/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/django_llm_tally"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+

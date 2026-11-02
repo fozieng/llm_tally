@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>{{TITLE}}</title>
+<style>
+{{DASHBOARD_CSS}}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>{{TITLE}}</h1>
+    <div class="subtitle" id="headerSubtitle"></div>
+  </div>
+</header>
+
+<!-- Direct Answers to the 4 Core Questions -->
+<div class="questions-grid">
+  <div class="q-card">
+    <div class="q-title">1. How much money did I spend this week?</div>
+    <div class="q-answer" id="q1Answer">$0.00</div>
+    <div class="q-sub" id="q1Sub"></div>
+  </div>
+  <div class="q-card">
+    <div class="q-title">2. Which feature costs the most?</div>
+    <div class="q-answer" id="q2Answer">N/A</div>
+    <div class="q-sub" id="q2Sub"></div>
+  </div>
+  <div class="q-card">
+    <div class="q-title">3. Which calls fail the most?</div>
+    <div class="q-answer" id="q3Answer">None (0 failures)</div>
+    <div class="q-sub" id="q3Sub"></div>
+  </div>
+  <div class="q-card">
+    <div class="q-title">4. Which calls are slow?</div>
+    <div class="q-answer" id="q4Answer">N/A</div>
+    <div class="q-sub">Ranked by average &amp; P95 execution latency</div>
+  </div>
+</div>
+
+<!-- 7-Day Spend Breakdown -->
+<div class="section">
+  <h2>Weekly Spend Breakdown (Last 7 Days)</h2>
+  <div class="sec-desc">Daily LLM cost and call volume answering &ldquo;How much money did I spend this week?&rdquo;</div>
+  <div class="weekly-chart" id="weeklyChart"></div>
+</div>
+
+<!-- Feature & Config Cost Breakdown -->
+<div class="section">
+  <h2>Cost by Feature &amp; Configuration (&ldquo;Which feature costs the most?&rdquo;)</h2>
+  <div class="sec-desc">Breakdown of cost per feature and per configuration settings, sorted from highest to lowest spend.</div>
+  <div style="overflow-x:auto;">
+    <table>
+      <thead>
+        <tr>
+          <th>Feature</th>
+          <th>Config Settings</th>
+          <th>Models</th>
+          <th class="num">Total Cost</th>
+          <th class="num">This Week</th>
+          <th>Share of Spend</th>
+          <th class="num">Calls</th>
+          <th class="num">In / Out Tokens</th>
+        </tr>
+      </thead>
+      <tbody id="featureCostsBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="two-col">
+  <!-- Which calls fail the most? -->
+  <div class="section">
+    <h2>Failure &amp; Retry Analysis (&ldquo;Which calls fail the most?&rdquo;)</h2>
+    <div class="sec-desc">Tracks HTTP 5xx and network retry attempts ([0.5s, 1.0s, 1.5s]) and exhausted failures.</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th>Function</th>
+            <th class="num">Failures / Rate</th>
+            <th class="num">Retries</th>
+            <th>Last Error</th>
+          </tr>
+        </thead>
+        <tbody id="failureStatsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Which calls are slow? -->
+  <div class="section">
+    <h2>Latency Leaderboard (&ldquo;Which calls are slow?&rdquo;)</h2>
+    <div class="sec-desc">Average, 95th percentile (P95), and maximum response times per feature.</div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th>Function</th>
+            <th>Models</th>
+            <th class="num">Avg Latency</th>
+            <th class="num">P95</th>
+            <th class="num">Max</th>
+            <th class="num">Calls</th>
+          </tr>
+        </thead>
+        <tbody id="latencyStatsBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Searchable Call Explorer -->
+<div class="section">
+  <h2>Search Call Logs</h2>
+  <div class="sec-desc">Search by feature name, model, config settings, input/output preview, or error message.</div>
+  <div class="search-bar">
+    <input type="search" id="searchInput" placeholder="Search feature, model, config, input, output, or error..." />
+    <select id="statusFilter">
+      <option value="all">All Statuses</option>
+      <option value="success">Success (Live Call)</option>
+      <option value="cached">Cached Hit</option>
+      <option value="failed">Failed</option>
+    </select>
+  </div>
+  <div style="overflow-x:auto;">
+    <table id="callsTable">
+      <thead>
+        <tr>
+          <th>Timestamp (UTC)</th>
+          <th>Feature</th>
+          <th>Model</th>
+          <th>Status</th>
+          <th class="num">Cost</th>
+          <th class="num">Latency</th>
+          <th class="num">Tokens (In/Out)</th>
+          <th class="num">Retries</th>
+          <th>Config / Details</th>
+        </tr>
+      </thead>
+      <tbody id="callsTableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const REPORT_DATA = {{REPORT_JSON}};
+{{DASHBOARD_JS}}
+</script>
+</body>
+</html>
+

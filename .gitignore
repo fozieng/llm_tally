@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local LLM Tally runtime logs & generated dashboards
+.llm_tally/
+.ailoghelper/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+
