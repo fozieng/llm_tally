@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Iterator, List
 
-from django_llm_tally import (
+from llm_tally import (
     InMemoryCache,
     LLMTally,
     PricingRegistry,
@@ -787,3 +787,111 @@ class TestAll15BugRegressions(unittest.TestCase):
         self.assertTrue(hit2)
         self.assertEqual(res2.data["text"], "immutable-answer")
         self.assertEqual(res2.data["items"], ["x", "y"])
+
+    # ------------------------------------------------------------------
+    # Issue M: Dashboard single-pass placeholder replacement
+    # ------------------------------------------------------------------
+    def test_issue_M_dashboard_placeholders_in_prompt_and_title_do_not_corrupt_json(self) -> None:
+        import json as _json
+        import re as _re
+
+        from llm_tally.dashboard import render_dashboard_html
+
+        with tempfile.TemporaryDirectory() as td:
+            tally = LLMTally(
+                log_path=Path(td) / "logs.jsonl",
+                dashboard_path=Path(td) / "dashboard.html",
+                auto_update_dashboard=False,
+            )
+
+            @tally.track(feature="feat_{{DASHBOARD_JS}}", model="gpt-4o-mini")
+            def ask(prompt: str) -> str:
+                return f"Echo: {prompt} and {{{{REPORT_JSON}}}} </script>"
+
+            ask("What does {{DASHBOARD_JS}} or {{DASHBOARD_CSS}} or {{TITLE}} do?")
+            html_out = render_dashboard_html(
+                tally.get_records(),
+                title="My Title {{REPORT_JSON}} & {{DASHBOARD_JS}} <script>",
+            )
+
+            # Extract the embedded JSON from `const REPORT_DATA = ...;`
+            match = _re.search(
+                r"const REPORT_DATA = (\{.*?\});\n",
+                html_out,
+                flags=_re.DOTALL,
+            )
+            self.assertIsNotNone(match)
+            parsed = _json.loads(match.group(1))
+            self.assertEqual(len(parsed["recent_calls"]), 1)
+            rec = parsed["recent_calls"][0]
+            self.assertIn("{{DASHBOARD_JS}}", rec["input_preview"])
+            self.assertIn("{{REPORT_JSON}}", rec["output_preview"])
+            self.assertIn("feat_{{DASHBOARD_JS}}", rec["feature"])
+            # Ensure the dashboard JS was injected only once, not pasted into the JSON
+            self.assertEqual(html_out.count("function renderSummaryAndKpis("), 1)
+            # Title placeholders must be literal HTML-escaped text, not expanded to JSON/JS
+            self.assertIn(
+                "<title>My Title {{REPORT_JSON}} &amp; {{DASHBOARD_JS}} &lt;script&gt;</title>",
+                html_out,
+            )
+
+    # ------------------------------------------------------------------
+    # Issue N: Concurrent multiprocess streaming calls do not lose log records
+    # ------------------------------------------------------------------
+    def test_issue_N_multiprocess_stream_updates_preserve_all_records(self) -> None:
+        import multiprocessing
+
+        with tempfile.TemporaryDirectory() as td:
+            log_file = Path(td) / "mp_logs.jsonl"
+            ctx = multiprocessing.get_context("spawn")
+            procs = [
+                ctx.Process(target=_mp_stream_worker, args=(str(log_file), wid, 120))
+                for wid in range(4)
+            ]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(timeout=60)
+                self.assertEqual(p.exitcode, 0)
+
+            from llm_tally.tracker import JSONLLogger
+
+            logger = JSONLLogger(log_file)
+            records = logger.read_all()
+            self.assertEqual(len(records), 480)
+            # Also verify raw line count in the file is 480 and all stream updates finalized
+            raw_lines = [ln for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertEqual(len(raw_lines), 480)
+            self.assertTrue(all(r.output_tokens > 0 for r in records))
+
+
+def _mp_stream_worker(log_path: str, worker_id: int, count: int) -> None:
+    """Top-level multiprocessing worker that runs `count` tracked streaming calls."""
+    tally = LLMTally(
+        log_path=log_path,
+        auto_update_dashboard=False,
+    )
+
+    class _WorkerStream:
+        def __init__(self, idx: int) -> None:
+            self._items = [f"w{worker_id}-{idx}-chunk1 ", f"w{worker_id}-{idx}-chunk2"]
+            self._pos = 0
+
+        def __iter__(self) -> "_WorkerStream":
+            return self
+
+        def __next__(self) -> str:
+            if self._pos >= len(self._items):
+                raise StopIteration
+            val = self._items[self._pos]
+            self._pos += 1
+            return val
+
+    @tally.track(feature=f"worker_{worker_id}", model="gpt-4o-mini", retry=False)
+    def stream_call(idx: int) -> _WorkerStream:
+        return _WorkerStream(idx)
+
+    for i in range(count):
+        s = stream_call(i)
+        list(s)
+

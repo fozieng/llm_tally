@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from django_llm_tally import (
+from llm_tally import (
     LLMTally,
     PricingRegistry,
     RetryExhaustedError,

@@ -1,8 +1,8 @@
-# django-llm-tally
+# llm-tally
 
-Zero-dependency Python & Django package for **self-evicting in-memory LLM caching**, **resilient HTTP 500/network retries**, and **per-feature cost & reliability analytics** with a self-contained **HTML dashboard**.
+Zero-dependency Python toolkit for **self-evicting in-memory LLM caching**, **resilient HTTP 500/network retries**, and **per-feature cost & reliability analytics** with a self-contained **HTML dashboard**.
 
-Works in any Python 3.9+ application with zero external runtime dependencies, and includes optional first-class Django integration via `settings.LLM_TALLY`.
+Works in any Python 3.9+ application with zero external runtime dependencies.
 
 ---
 
@@ -11,7 +11,7 @@ Works in any Python 3.9+ application with zero external runtime dependencies, an
 ### 1. Self-Evicting Local In-Memory Cache (`cached_call` / `@tally.cache`)
 The cache function (`tally.cached_call`, `@tally.cache`, or standalone `cached_llm_call`) creates a thread-safe local cache in memory:
 - **Input + Settings Snapshot**: Hashes and stores the function's input arguments (`args`, `kwargs`) together with its configuration settings (`model`, `feature`, `config`) alongside the generated `output`.
-- **Instant Cache Hits**: Calling the function with the exact same stored input and settings returns the cached output without invoking the LLM.
+- **Instant Cache Hits**: Calling the function with the exact same stored input and settings returns a copy of the cached output without invoking the LLM.
 - **Lifetime (`ttl`) Auto-Vanish**: Every cached entry has a configurable lifetime (`ttl` in seconds, default `300s`). Once the lifetime expires, the next time the entry is fetched it **vanishes itself** from memory and executes the function to generate and store a new response.
 - **Kill After `X` Requests (`max_requests`)**: You can configure an entry to **kill itself after `X` requests** (`max_requests=X`). Once the cached entry has been fetched `X` times, it vanishes from memory so the subsequent call generates a fresh response.
 
@@ -21,20 +21,20 @@ The cache function (`tally.cached_call`, `@tally.cache`, or standalone `cached_l
 - If all attempts fail, raises `RetryExhaustedError` containing the full list of errors from every attempt (`err.attempts` and `err.errors`).
 
 ### 3. Per-Feature Cost Analyzer & Interactive HTML Dashboard
-- **Built-in Pricing for OpenAI, Anthropic, and Google Gemini**: Preloaded with token pricing for `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `o1`, `o3`, `claude-sonnet-4`, `claude-3-7-sonnet`, `claude-3-5-sonnet`, `claude-3-5-haiku`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.0-flash`, and more—while always letting you choose or register any custom model.
+- **Built-in Pricing for OpenAI, Anthropic, and Google Gemini**: Preloaded with token pricing for `gpt-5`, `gpt-5-mini`, `gpt-4.1`, `gpt-4o`, `gpt-4o-mini`, `o1`, `o3`, `o3-pro`, `claude-opus-4-5`, `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-3-7-sonnet`, `claude-3-5-sonnet`, `gemini-3-pro`, `gemini-3-flash`, `gemini-2.5-pro`, `gemini-2.5-flash`, and more—while always letting you choose or register any custom model.
 - **Self-Contained Static HTML Dashboard (`.llm_tally/dashboard.html`)**: Automatically updates and answers:
   1. **How much money did I spend this week?** (7-day total, daily bar chart, today/all-time spend, and money saved by caching)
   2. **Which feature costs the most?** (Ranked cost table per feature and per config)
   3. **Which calls fail the most?** (Failure rates, retry counts, and recent errors per feature/function)
   4. **Which calls are slow?** (Average, P95, and Max latency leaderboard)
-  5. **Interactive Search**: Live client-side search across features, models, configs, inputs/outputs, Statuses, and error messages.
+  5. **Interactive Search**: Live client-side search across features, models, configs, inputs/outputs, statuses, and error messages.
 
 ---
 
 ## Installation
 
 ```bash
-pip install django-llm-tally
+pip install llm-tally
 ```
 
 ---
@@ -42,7 +42,7 @@ pip install django-llm-tally
 ## Quick Start
 
 ```python
-from django_llm_tally import LLMTally, RetryExhaustedError
+from llm_tally import LLMTally, RetryExhaustedError
 
 tally = LLMTally(
     default_model="gpt-4o-mini",
@@ -84,7 +84,7 @@ Developers should note how `tally.cached_call` (and standalone `cached_llm_call`
 4. If `max_requests=X` is configured, the entry kills itself after `X` cached requests so the next request generates a new response.
 
 ```python
-from django_llm_tally import cached_llm_call
+from llm_tally import cached_llm_call
 
 def expensive_prompt(topic: str, style: str = "concise") -> str:
     return f"Generated summary for {topic} ({style})"
@@ -108,7 +108,7 @@ out1 = cached_llm_call(
 ## Handling Retries & Aggregated Errors (Feature 2)
 
 ```python
-from django_llm_tally import LLMTally, RetryExhaustedError
+from llm_tally import LLMTally, RetryExhaustedError
 
 tally = LLMTally()
 
@@ -156,40 +156,6 @@ print(f"Open {dashboard_file} in your browser!")
 
 ---
 
-## Optional Django Integration
-
-If you use `django-llm-tally` in a Django project, you can configure defaults in `settings.py`:
-
-```python
-# settings.py
-LLM_TALLY = {
-    "DEFAULT_MODEL": "gemini-2.5-flash",
-    "LOG_PATH": ".llm_tally/logs.jsonl",
-    "DASHBOARD_PATH": ".llm_tally/dashboard.html",
-    "CACHE_ENABLED": True,
-    "DEFAULT_TTL": 300.0,
-    "DEFAULT_MAX_REQUESTS": 20,
-    "RETRY_ENABLED": True,
-    "DEFAULT_RETRIES": 3,
-    "RETRY_DELAYS": (0.5, 1.0, 1.5),
-}
-```
-
-And optionally expose the live HTML dashboard in `urls.py`:
-
-```python
-# urls.py
-from django.urls import path
-from django_llm_tally import make_django_dashboard_view
-
-urlpatterns = [
-    path("admin/llm-tally/", make_django_dashboard_view(), name="llm_tally_dashboard"),
-]
-```
-
----
-
 ## License
 
 MIT
-

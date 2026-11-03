@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from typing import List
 
-from django_llm_tally import AILogHelper, LLMTally
+from llm_tally import AILogHelper, LLMTally
 
 
 def test_end_to_end_sync_and_async_pipeline(tmp_path: Path | None = None) -> None:

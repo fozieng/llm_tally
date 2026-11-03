@@ -14,12 +14,18 @@ import collections.abc
 import inspect
 import json
 import math
+import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -303,69 +309,161 @@ def _safe_json_dumps(obj: Any, sort_keys: bool = False) -> str:
         return json.dumps(str(obj), ensure_ascii=False)
 
 
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        written += os.write(fd, view[written:])
+
+
+def _read_all_bytes(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: List[bytes] = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class JSONLLogger:
-    """Thread-safe JSONL reader and writer for `CallRecord` events."""
+    """
+    Thread-safe and multiprocess-safe JSONL reader and writer for `CallRecord` events.
+
+    Coordinates concurrent threads (`threading.RLock`) and concurrent worker processes
+    (`fcntl.flock` on the shared log file descriptor without `O_TRUNC` on open) so
+    both `append()` and in-place `update()` preserve every record under multiprocess load.
+    """
 
     def __init__(self, log_path: str | Path = ".llm_tally/logs.jsonl") -> None:
         self.log_path = Path(log_path)
         self._lock = threading.RLock()
 
+    def _append_line(self, line: str) -> None:
+        with self._lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = (line + "\n").encode("utf-8")
+            fd = os.open(
+                str(self.log_path),
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o644,
+            )
+            try:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                    except OSError:
+                        pass
+                _write_all(fd, payload)
+            finally:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(fd)
+
     def append(self, record: CallRecord) -> None:
         """Append a single `CallRecord` line to the JSONL log file."""
-        with self._lock:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            line = _safe_json_dumps(record.to_dict(), sort_keys=False)
-            with self.log_path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+        line = _safe_json_dumps(record.to_dict(), sort_keys=False)
+        self._append_line(line)
 
     def update(self, record: CallRecord) -> None:
-        """Update an existing `CallRecord` by `id` in the JSONL file, or append it if not present."""
+        """
+        Update an existing `CallRecord` (matched by `record.id`) in the JSONL log file,
+        or append it if not found. Holds an exclusive `flock` on the file descriptor across
+        the read-modify-write cycle without ever truncating on open or replacing the inode,
+        preventing record loss across concurrent processes.
+        """
+        new_line_bytes = _safe_json_dumps(record.to_dict(), sort_keys=False).encode("utf-8")
+        target_id = record.id
+        id_needle = f'"{target_id}"'.encode("utf-8")
+
         with self._lock:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            if not self.log_path.exists():
-                self.append(record)
-                return
+            fd = os.open(
+                str(self.log_path),
+                os.O_RDWR | os.O_CREAT,
+                0o644,
+            )
+            try:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                    except OSError:
+                        pass
 
-            lines_out: List[str] = []
-            replaced = False
-            with self.log_path.open("r", encoding="utf-8") as fh:
-                for raw_line in fh:
-                    stripped = raw_line.strip()
-                    if not stripped:
+                raw_bytes = _read_all_bytes(fd)
+                lines = [ln for ln in raw_bytes.splitlines() if ln.strip()]
+                replaced = False
+                for idx in range(len(lines) - 1, -1, -1):
+                    raw_line = lines[idx]
+                    if id_needle not in raw_line:
                         continue
                     try:
-                        data = json.loads(stripped)
-                        if data.get("id") == record.id:
-                            lines_out.append(_safe_json_dumps(record.to_dict(), sort_keys=False))
-                            replaced = True
-                        else:
-                            lines_out.append(stripped)
+                        parsed = json.loads(raw_line.decode("utf-8"))
                     except Exception:
-                        lines_out.append(stripped)
+                        continue
+                    if isinstance(parsed, dict) and parsed.get("id") == target_id:
+                        lines[idx] = new_line_bytes
+                        replaced = True
+                        break
 
-            if not replaced:
-                lines_out.append(_safe_json_dumps(record.to_dict(), sort_keys=False))
+                if not replaced:
+                    lines.append(new_line_bytes)
 
-            with self.log_path.open("w", encoding="utf-8") as fh:
-                fh.write("\n".join(lines_out) + "\n")
+                updated_payload = b"\n".join(lines) + b"\n"
+                os.lseek(fd, 0, os.SEEK_SET)
+                _write_all(fd, updated_payload)
+                os.ftruncate(fd, len(updated_payload))
+            finally:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(fd)
 
     def read_all(self) -> List[CallRecord]:
-        """Read all stored `CallRecord` entries from the JSONL log file."""
+        """
+        Read all stored `CallRecord` entries from the JSONL log file under a shared file lock,
+        coalescing by `record.id` in original insertion order.
+        """
         with self._lock:
             if not self.log_path.exists():
                 return []
-            records: List[CallRecord] = []
-            with self.log_path.open("r", encoding="utf-8") as fh:
-                for raw_line in fh:
-                    stripped = raw_line.strip()
-                    if not stripped:
-                        continue
+            try:
+                fd = os.open(str(self.log_path), os.O_RDONLY)
+            except FileNotFoundError:
+                return []
+            try:
+                if fcntl is not None:
                     try:
-                        data = json.loads(stripped)
-                        records.append(CallRecord.from_dict(data))
-                    except Exception:
-                        continue
-            return records
+                        fcntl.flock(fd, fcntl.LOCK_SH)
+                    except OSError:
+                        pass
+                raw_bytes = _read_all_bytes(fd)
+            finally:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(fd)
+
+            records_by_id: Dict[str, CallRecord] = {}
+            for raw_line in raw_bytes.decode("utf-8", errors="replace").splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    data = json.loads(stripped)
+                    rec = CallRecord.from_dict(data)
+                    records_by_id[rec.id] = rec
+                except Exception:
+                    continue
+            return list(records_by_id.values())
 
     def clear(self) -> None:
         """Remove all records from the JSONL log file."""

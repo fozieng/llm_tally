@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from typing import List
 
-from django_llm_tally import (
+from llm_tally import (
     DEFAULT_RETRY_DELAYS,
     RetryConfig,
     RetryExhaustedError,

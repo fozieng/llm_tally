@@ -25,7 +25,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, T
 
 from .cache import InMemoryCache, build_cache_key, is_llm_stream
 from .dashboard import render_dashboard_html, write_dashboard_file
-from .django_integration import get_django_llm_tally_settings
 from .pricing import ModelPricing, PricingRegistry
 from .retry import (
     DEFAULT_RETRY_DELAYS,
@@ -456,76 +455,36 @@ class _AsyncStreamProxy:
 class LLMTally:
     """
     Main manager for caching, retrying, and tracking LLM calls & costs.
-    Can be configured directly in Python or via `settings.LLM_TALLY` in Django.
     """
 
     def __init__(
         self,
-        default_model: Optional[str] = None,
-        log_path: Optional[str | Path] = None,
-        dashboard_path: Optional[str | Path] = None,
-        default_cache_enabled: Optional[bool] = None,
+        default_model: str = "gpt-4o-mini",
+        log_path: str | Path = ".llm_tally/logs.jsonl",
+        dashboard_path: str | Path = ".llm_tally/dashboard.html",
+        default_cache_enabled: bool = True,
         default_ttl: Optional[float] = 300.0,
         default_max_requests: Optional[int] = None,
         default_max_cache_size: Optional[int] = 1000,
-        default_retry_enabled: Optional[bool] = None,
-        default_retries: Optional[int] = None,
-        retry_delays: Optional[Sequence[float]] = None,
-        auto_update_dashboard: Optional[bool] = None,
+        default_retry_enabled: bool = True,
+        default_retries: int = 3,
+        retry_delays: Sequence[float] = DEFAULT_RETRY_DELAYS,
+        auto_update_dashboard: bool = True,
         custom_pricing: Optional[Dict[str, ModelPricing]] = None,
         sleep_func: Optional[Callable[[float], Any]] = None,
         async_sleep_func: Optional[Callable[[float], Any]] = None,
     ) -> None:
-        dj = get_django_llm_tally_settings()
-
-        self.default_model: str = str(
-            default_model if default_model is not None else dj.get("DEFAULT_MODEL", "gpt-4o-mini")
-        )
-        self.log_path: Path = Path(
-            log_path if log_path is not None else dj.get("LOG_PATH", ".llm_tally/logs.jsonl")
-        )
-        self.dashboard_path: Path = Path(
-            dashboard_path
-            if dashboard_path is not None
-            else dj.get("DASHBOARD_PATH", ".llm_tally/dashboard.html")
-        )
-        self.default_cache_enabled: bool = bool(
-            default_cache_enabled
-            if default_cache_enabled is not None
-            else dj.get("CACHE_ENABLED", True)
-        )
-        self.default_ttl: Optional[float] = (
-            default_ttl if default_ttl is not None else dj.get("DEFAULT_TTL", None)
-        )
-        self.default_max_requests: Optional[int] = (
-            default_max_requests
-            if default_max_requests is not None
-            else dj.get("DEFAULT_MAX_REQUESTS", None)
-        )
-        self.default_max_cache_size: Optional[int] = (
-            default_max_cache_size
-            if default_max_cache_size is not None
-            else dj.get("DEFAULT_MAX_CACHE_SIZE", 1000)
-        )
-        self.default_retry_enabled: bool = bool(
-            default_retry_enabled
-            if default_retry_enabled is not None
-            else dj.get("RETRY_ENABLED", True)
-        )
-        self.default_retries: int = int(
-            default_retries if default_retries is not None else dj.get("DEFAULT_RETRIES", 3)
-        )
-        raw_delays = (
-            retry_delays
-            if retry_delays is not None
-            else dj.get("RETRY_DELAYS", DEFAULT_RETRY_DELAYS)
-        )
-        self.retry_delays: Tuple[float, ...] = tuple(float(d) for d in raw_delays)
-        self.auto_update_dashboard: bool = bool(
-            auto_update_dashboard
-            if auto_update_dashboard is not None
-            else dj.get("AUTO_UPDATE_DASHBOARD", True)
-        )
+        self.default_model: str = str(default_model)
+        self.log_path: Path = Path(log_path)
+        self.dashboard_path: Path = Path(dashboard_path)
+        self.default_cache_enabled: bool = bool(default_cache_enabled)
+        self.default_ttl: Optional[float] = default_ttl
+        self.default_max_requests: Optional[int] = default_max_requests
+        self.default_max_cache_size: Optional[int] = default_max_cache_size
+        self.default_retry_enabled: bool = bool(default_retry_enabled)
+        self.default_retries: int = int(default_retries)
+        self.retry_delays: Tuple[float, ...] = tuple(float(d) for d in retry_delays)
+        self.auto_update_dashboard: bool = bool(auto_update_dashboard)
 
         self.cache_store = InMemoryCache(
             default_ttl=self.default_ttl,
@@ -536,20 +495,6 @@ class LLMTally:
         self.logger = JSONLLogger(log_path=self.log_path)
         self._sleep_func = sleep_func or time.sleep
         self._async_sleep_func = async_sleep_func or asyncio.sleep
-
-        # Register any custom models defined in Django settings.LLM_TALLY["CUSTOM_MODELS"]
-        dj_models = dj.get("CUSTOM_MODELS")
-        if isinstance(dj_models, dict):
-            for model_name, rates in dj_models.items():
-                if isinstance(rates, dict):
-                    self.register_model(
-                        model=model_name,
-                        input_cost_per_1m=float(rates.get("input_cost_per_1m", 0.5)),
-                        output_cost_per_1m=float(rates.get("output_cost_per_1m", 1.5)),
-                        provider=str(rates.get("provider", "custom")),
-                        cached_input_cost_per_1m=rates.get("cached_input_cost_per_1m"),
-                        cache_creation_cost_per_1m=rates.get("cache_creation_cost_per_1m"),
-                    )
 
     # -------------------------------------------------------------------------
     # Model Pricing Management
@@ -1461,7 +1406,7 @@ class LLMTally:
         except Exception as log_exc:
             try:
                 warnings.warn(
-                    f"django-llm-tally failed to write telemetry log or dashboard: {log_exc}",
+                    f"llm-tally failed to write telemetry log or dashboard: {log_exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -1521,7 +1466,7 @@ class LLMTally:
         except Exception as log_exc:
             try:
                 warnings.warn(
-                    f"django-llm-tally failed to update stream telemetry log: {log_exc}",
+                    f"llm-tally failed to update stream telemetry log: {log_exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -1549,7 +1494,7 @@ class LLMTally:
 
     def render_dashboard(
         self,
-        title: str = "django-llm-tally — Cost & Reliability Dashboard",
+        title: str = "llm-tally — Cost & Reliability Dashboard",
     ) -> str:
         """Render the self-contained HTML dashboard as a string."""
         records = self.logger.read_all()
@@ -1558,7 +1503,7 @@ class LLMTally:
     def generate_dashboard(
         self,
         dashboard_path: Optional[str | Path] = None,
-        title: str = "django-llm-tally — Cost & Reliability Dashboard",
+        title: str = "llm-tally — Cost & Reliability Dashboard",
     ) -> Path:
         """Write/update the static HTML dashboard file on disk and return its path."""
         target = Path(dashboard_path) if dashboard_path is not None else self.dashboard_path

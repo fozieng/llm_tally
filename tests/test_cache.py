@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from django_llm_tally import InMemoryCache, LLMTally, cached_llm_call
+from llm_tally import InMemoryCache, LLMTally, cached_llm_call
 
 
 def test_cache_stores_input_settings_and_returns_same_output() -> None:

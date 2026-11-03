@@ -1,5 +1,5 @@
 """
-`django-llm-tally`: Zero-dependency LLM helper for Python & Django.
+`llm-tally`: Zero-dependency LLM helper for Python.
 
 Features:
 1. Self-evicting local in-memory cache (`cached_llm_call`, `LLMTally.cached_call`, `@tally.cache`)
@@ -15,7 +15,6 @@ Features:
 from .cache import CacheConfig, CacheEntry, InMemoryCache, build_cache_key, cached_llm_call
 from .core import AILogHelper, LLMTally, get_default_tally
 from .dashboard import render_dashboard_html, write_dashboard_file
-from .django_integration import get_django_llm_tally_settings, make_django_dashboard_view
 from .pricing import DEFAULT_PRICING, ModelPricing, PricingRegistry
 from .retry import (
     DEFAULT_RETRY_DELAYS,
@@ -59,7 +58,4 @@ __all__ = [
     "analyze_logs",
     "render_dashboard_html",
     "write_dashboard_file",
-    "get_django_llm_tally_settings",
-    "make_django_dashboard_view",
 ]
-
