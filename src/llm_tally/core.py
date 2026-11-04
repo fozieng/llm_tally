@@ -14,14 +14,33 @@ Unifies:
 from __future__ import annotations
 
 import asyncio
+import atexit
+import contextlib
+import contextvars
 import functools
 import inspect
+import os
+import queue
+import threading
 import time
 import uuid
 import warnings
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 from .cache import InMemoryCache, build_cache_key, is_llm_stream
 from .dashboard import render_dashboard_html, write_dashboard_file
@@ -40,10 +59,42 @@ from .tracker import (
     TokenUsage,
     analyze_logs,
     extract_token_usage,
+    filter_records_since,
     format_preview,
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
+RecordSink = Callable[[CallRecord], Any]
+
+DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_LOG_PATH = ".llm_tally/logs.jsonl"
+DEFAULT_DASHBOARD_PATH = ".llm_tally/dashboard.html"
+DEFAULT_DASHBOARD_TITLE = "llm-tally — Cost & Reliability Dashboard"
+
+# Metadata set via `tally.context(...)`; contextvars keep it per-thread and per-asyncio-task
+_CONTEXT_METADATA: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "llm_tally_context_metadata", default={}
+)
+
+# Instances with a throttled, not-yet-written dashboard are flushed at interpreter exit
+_LIVE_TALLIES: "weakref.WeakSet[LLMTally]" = weakref.WeakSet()
+
+
+@atexit.register
+def _flush_all_dashboards() -> None:
+    for tally in list(_LIVE_TALLIES):
+        try:
+            tally.flush()
+        except Exception:
+            pass
+
+
+def _call_time_model(kwargs: Dict[str, Any]) -> Optional[str]:
+    """Return the `model=` keyword the wrapped function was called with, if it is a string."""
+    val = kwargs.get("model")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
 
 
 def _extract_chunk_text(chunk: Any) -> str:
@@ -95,8 +146,29 @@ class _StreamUsageAccumulator:
         self.input_excludes_cached: Optional[bool] = None
         self.collected_text: List[str] = []
 
+    def observe_snapshot(self, stream: Any) -> None:
+        """
+        If no chunk carried usage (e.g. the caller iterated Anthropic's `stream.text_stream`
+        instead of the stream itself), read usage from the SDK's accumulated message snapshot.
+        """
+        if self.has_structured_usage:
+            return
+        for attr in ("current_message_snapshot", "current_completion_snapshot"):
+            try:
+                snapshot = getattr(stream, attr, None)
+            except Exception:
+                continue
+            if snapshot is not None:
+                self._observe_usage(extract_token_usage(snapshot, args=(), kwargs={}))
+                return
+
     def observe_chunk(self, chunk: Any) -> None:
-        u = extract_token_usage(chunk, args=(), kwargs={})
+        self._observe_usage(extract_token_usage(chunk, args=(), kwargs={}))
+        piece = _extract_chunk_text(chunk)
+        if piece:
+            self.collected_text.append(piece)
+
+    def _observe_usage(self, u: TokenUsage) -> None:
         if u.detected_model and not self.detected_model:
             self.detected_model = u.detected_model
 
@@ -117,10 +189,6 @@ class _StreamUsageAccumulator:
                 self.cache_creation_input_tokens = u.cache_creation_input_tokens
             if u.input_excludes_cached is not None:
                 self.input_excludes_cached = u.input_excludes_cached
-
-        piece = _extract_chunk_text(chunk)
-        if piece:
-            self.collected_text.append(piece)
 
     def build_final_usage(
         self,
@@ -152,6 +220,7 @@ class _SyncStreamProxy:
     Transparent proxy around a synchronous generator or SDK stream object.
     Preserves `.close()`, `with ... as stream:`, `.response`, and custom SDK attributes,
     while updating the pre-logged `CallRecord` on completion or mid-stream failure.
+    A proxy that is garbage-collected before the stream finishes is logged as `incomplete`.
     """
 
     def __init__(
@@ -171,8 +240,12 @@ class _SyncStreamProxy:
         explicit_output_tokens: Optional[int],
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._stream = stream
+        # The original context manager when `__enter__` returned a different stream object
+        self._cm: Any = None
+        self._metadata = dict(metadata or {})
         self._iterator: Optional[Any] = None
         self._tally = tally
         self._record_id = record_id
@@ -221,7 +294,17 @@ class _SyncStreamProxy:
     def __enter__(self) -> "_SyncStreamProxy":
         enter_fn = getattr(self._stream, "__enter__", None)
         if callable(enter_fn):
-            enter_fn()
+            try:
+                entered = enter_fn()
+            except BaseException as exc:
+                # SDK stream managers send the request on enter; log the real failure
+                self._finalize(status="failed", error_message=f"{type(exc).__name__}: {exc}")
+                raise
+            # e.g. Anthropic `MessageStreamManager.__enter__()` returns the real `MessageStream`
+            if entered is not None and entered is not self._stream:
+                self._cm = self._stream
+                self._stream = entered
+                self._iterator = None
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
@@ -229,23 +312,42 @@ class _SyncStreamProxy:
             self._finalize(status="failed", error_message=f"{type(exc_val).__name__}: {exc_val}")
         else:
             self._finalize(status="success", error_message=None)
-        exit_fn = getattr(self._stream, "__exit__", None)
+        target = self._cm if self._cm is not None else self._stream
+        exit_fn = getattr(target, "__exit__", None)
         if callable(exit_fn):
             return exit_fn(exc_type, exc_val, exc_tb)
-        close_fn = getattr(self._stream, "close", None)
+        close_fn = getattr(target, "close", None)
         if callable(close_fn):
             close_fn()
         return False
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
+        # Guard against recursion when `__init__` never ran (e.g. during `__del__`)
+        if "_stream" not in self.__dict__:
+            raise AttributeError(name)
+        return getattr(self.__dict__["_stream"], name)
+
+    def __del__(self) -> None:
+        if self.__dict__.get("_finalized", True):
+            return
+        try:
+            self._finalize(
+                status="incomplete",
+                error_message="Stream was abandoned before it was fully consumed or closed",
+            )
+        except Exception:
+            pass
 
     def _finalize(self, status: str, error_message: Optional[str]) -> None:
         if self._finalized:
             return
         self._finalized = True
         latency_ms = (time.perf_counter() - self._start_perf) * 1000.0
+        self._acc.observe_snapshot(self._stream)
         usage, joined_text = self._acc.build_final_usage(self._args, self._kwargs)
+        estimated = usage.estimated and not (
+            self._explicit_input_tokens is not None and self._explicit_output_tokens is not None
+        )
         in_tok = (
             self._explicit_input_tokens
             if self._explicit_input_tokens is not None
@@ -291,6 +393,8 @@ class _SyncStreamProxy:
             args=self._args,
             kwargs=self._kwargs,
             response=joined_text or "<stream>",
+            estimated_tokens=estimated,
+            metadata=self._metadata,
         )
 
 
@@ -317,8 +421,12 @@ class _AsyncStreamProxy:
         explicit_output_tokens: Optional[int],
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._stream = stream
+        # The original async context manager when `__aenter__` returned a different stream object
+        self._cm: Any = None
+        self._metadata = dict(metadata or {})
         self._aiterator: Optional[Any] = None
         self._tally = tally
         self._record_id = record_id
@@ -381,7 +489,15 @@ class _AsyncStreamProxy:
     async def __aenter__(self) -> "_AsyncStreamProxy":
         aenter_fn = getattr(self._stream, "__aenter__", None)
         if callable(aenter_fn):
-            await aenter_fn()
+            try:
+                entered = await aenter_fn()
+            except BaseException as exc:
+                self._finalize(status="failed", error_message=f"{type(exc).__name__}: {exc}")
+                raise
+            if entered is not None and entered is not self._stream:
+                self._cm = self._stream
+                self._stream = entered
+                self._aiterator = None
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
@@ -389,21 +505,40 @@ class _AsyncStreamProxy:
             self._finalize(status="failed", error_message=f"{type(exc_val).__name__}: {exc_val}")
         else:
             self._finalize(status="success", error_message=None)
-        aexit_fn = getattr(self._stream, "__aexit__", None)
+        target = self._cm if self._cm is not None else self._stream
+        aexit_fn = getattr(target, "__aexit__", None)
         if callable(aexit_fn):
             return await aexit_fn(exc_type, exc_val, exc_tb)
         await self.aclose()
         return False
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
+        # Guard against recursion when `__init__` never ran (e.g. during `__del__`)
+        if "_stream" not in self.__dict__:
+            raise AttributeError(name)
+        return getattr(self.__dict__["_stream"], name)
+
+    def __del__(self) -> None:
+        if self.__dict__.get("_finalized", True):
+            return
+        try:
+            self._finalize(
+                status="incomplete",
+                error_message="Stream was abandoned before it was fully consumed or closed",
+            )
+        except Exception:
+            pass
 
     def _finalize(self, status: str, error_message: Optional[str]) -> None:
         if self._finalized:
             return
         self._finalized = True
         latency_ms = (time.perf_counter() - self._start_perf) * 1000.0
+        self._acc.observe_snapshot(self._stream)
         usage, joined_text = self._acc.build_final_usage(self._args, self._kwargs)
+        estimated = usage.estimated and not (
+            self._explicit_input_tokens is not None and self._explicit_output_tokens is not None
+        )
         in_tok = (
             self._explicit_input_tokens
             if self._explicit_input_tokens is not None
@@ -449,6 +584,8 @@ class _AsyncStreamProxy:
             args=self._args,
             kwargs=self._kwargs,
             response=joined_text or "<stream>",
+            estimated_tokens=estimated,
+            metadata=self._metadata,
         )
 
 
@@ -459,42 +596,337 @@ class LLMTally:
 
     def __init__(
         self,
-        default_model: str = "gpt-4o-mini",
-        log_path: str | Path = ".llm_tally/logs.jsonl",
-        dashboard_path: str | Path = ".llm_tally/dashboard.html",
-        default_cache_enabled: bool = True,
+        default_model: Optional[str] = None,
+        log_path: Optional[Union[str, Path]] = None,
+        dashboard_path: Optional[Union[str, Path]] = None,
+        default_cache_enabled: Optional[bool] = None,
         default_ttl: Optional[float] = 300.0,
         default_max_requests: Optional[int] = None,
         default_max_cache_size: Optional[int] = 1000,
-        default_retry_enabled: bool = True,
-        default_retries: int = 3,
-        retry_delays: Sequence[float] = DEFAULT_RETRY_DELAYS,
-        auto_update_dashboard: bool = True,
+        default_retry_enabled: Optional[bool] = None,
+        default_retries: Optional[int] = None,
+        retry_delays: Optional[Sequence[float]] = None,
+        auto_update_dashboard: Optional[bool] = None,
         custom_pricing: Optional[Dict[str, ModelPricing]] = None,
         sleep_func: Optional[Callable[[float], Any]] = None,
         async_sleep_func: Optional[Callable[[float], Any]] = None,
+        *,
+        dashboard_update_interval: float = 2.0,
+        dashboard_days: Optional[float] = None,
+        log_previews: bool = True,
+        redact: Optional[Callable[[str], str]] = None,
+        persist_logs: bool = True,
+        on_record: Optional[Union[RecordSink, Sequence[RecordSink]]] = None,
+        cache_backend: Optional[Any] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        retry_on_rate_limit: bool = True,
+        retry_jitter: float = 0.0,
+        max_retry_after: float = 60.0,
+        pricing_file: Optional[Union[str, Path]] = None,
+        max_log_mb: Optional[float] = None,
+        log_backups: int = 3,
+        async_sinks: bool = False,
+        sink_queue_size: int = 10_000,
     ) -> None:
-        self.default_model: str = str(default_model)
-        self.log_path: Path = Path(log_path)
-        self.dashboard_path: Path = Path(dashboard_path)
-        self.default_cache_enabled: bool = bool(default_cache_enabled)
+        """
+        Every positional argument accepts `None` to mean "use the default":
+        `default_model="gpt-4o-mini"`, `log_path=".llm_tally/logs.jsonl"`,
+        `dashboard_path=".llm_tally/dashboard.html"`, `default_cache_enabled=False`,
+        `default_retry_enabled=True`, `default_retries=3`, `retry_delays=(0.5, 1.0, 1.5)`,
+        `auto_update_dashboard=True`. For `default_ttl`, `default_max_requests`, and
+        `default_max_cache_size`, `None` means "no limit".
+
+        Keyword-only options:
+        - `dashboard_update_interval`: write the auto-updated dashboard at most once per this
+          many seconds (pending updates are flushed at exit or via `flush()`); `0` = every call.
+          The interval automatically stretches to 10x the last rebuild time so a large log never
+          spends more than ~10% of a core on dashboard rebuilds.
+        - `dashboard_days`: only include the last N days of logs in the dashboard.
+        - `log_previews=False` stops input/output text and error message text from being written
+          to logs and the dashboard (exception types and status codes are kept).
+        - `redact`: applied to previews, error messages, retry-attempt messages, and string values
+          in `config` before they are stored (e.g. to mask emails or keys). If it raises, the text
+          is stored as `"[redaction failed]"` and the record is still kept.
+        - `persist_logs=False` disables the JSONL file (use `on_record` sinks instead).
+        - `max_log_mb` / `log_backups`: rotate the JSONL file to `<log>.1` ... `<log>.N` when it
+          would exceed this size. Reports and the dashboard only read the current file.
+        - `on_record`: callable(s) receiving every finished `CallRecord` (ship to a DB, OTel, ...).
+        - `async_sinks=True` runs sinks on a background thread (bounded by `sink_queue_size`;
+          records are dropped with a warning if it fills up) so slow sinks never delay LLM calls.
+        - `cache_backend`: any object implementing `InMemoryCache`'s `fetch`/`store`/`clear`.
+        - `metadata`: tags added to every record (e.g. `{"env": "prod"}`).
+        - `retry_on_rate_limit`, `retry_jitter`, `max_retry_after`: HTTP 429 handling and backoff.
+        - `pricing_file`: JSON file of model prices loaded on top of the built-in catalog.
+        """
+        self.default_model: str = str(default_model) if default_model else DEFAULT_MODEL
+        self.log_path: Path = Path(log_path if log_path is not None else DEFAULT_LOG_PATH)
+        self.dashboard_path: Path = Path(
+            dashboard_path if dashboard_path is not None else DEFAULT_DASHBOARD_PATH
+        )
+        self.default_cache_enabled: bool = (
+            False if default_cache_enabled is None else bool(default_cache_enabled)
+        )
         self.default_ttl: Optional[float] = default_ttl
         self.default_max_requests: Optional[int] = default_max_requests
         self.default_max_cache_size: Optional[int] = default_max_cache_size
-        self.default_retry_enabled: bool = bool(default_retry_enabled)
-        self.default_retries: int = int(default_retries)
-        self.retry_delays: Tuple[float, ...] = tuple(float(d) for d in retry_delays)
-        self.auto_update_dashboard: bool = bool(auto_update_dashboard)
+        self.default_retry_enabled: bool = (
+            True if default_retry_enabled is None else bool(default_retry_enabled)
+        )
+        self.default_retries: int = 3 if default_retries is None else int(default_retries)
+        if self.default_retries < 0:
+            raise ValueError(f"default_retries must be >= 0, got {self.default_retries}")
+        self.retry_delays: Tuple[float, ...] = tuple(
+            float(d) for d in (DEFAULT_RETRY_DELAYS if retry_delays is None else retry_delays)
+        )
+        self.auto_update_dashboard: bool = (
+            True if auto_update_dashboard is None else bool(auto_update_dashboard)
+        )
+        self.dashboard_update_interval: float = max(0.0, float(dashboard_update_interval))
+        self.dashboard_days: Optional[float] = dashboard_days
+        self.log_previews: bool = bool(log_previews)
+        self.redact: Optional[Callable[[str], str]] = redact
+        self.persist_logs: bool = bool(persist_logs)
+        if on_record is None:
+            self.sinks: List[RecordSink] = []
+        elif callable(on_record):
+            self.sinks = [on_record]
+        else:
+            self.sinks = list(on_record)
+        self.metadata: Dict[str, Any] = dict(metadata or {})
+        self.retry_on_rate_limit: bool = bool(retry_on_rate_limit)
+        self.retry_jitter: float = max(0.0, float(retry_jitter))
+        self.max_retry_after: float = float(max_retry_after)
 
-        self.cache_store = InMemoryCache(
-            default_ttl=self.default_ttl,
-            default_max_requests=self.default_max_requests,
-            max_size=self.default_max_cache_size,
+        self.cache_store = (
+            cache_backend
+            if cache_backend is not None
+            else InMemoryCache(
+                default_ttl=self.default_ttl,
+                default_max_requests=self.default_max_requests,
+                max_size=self.default_max_cache_size,
+            )
         )
         self.pricing = PricingRegistry(custom_pricing=custom_pricing)
-        self.logger = JSONLLogger(log_path=self.log_path)
+        if pricing_file is not None:
+            self.pricing.load_file(pricing_file)
+        self.logger = JSONLLogger(
+            log_path=self.log_path,
+            max_bytes=int(max_log_mb * 1024 * 1024) if max_log_mb else None,
+            backups=log_backups,
+        )
         self._sleep_func = sleep_func or time.sleep
         self._async_sleep_func = async_sleep_func or asyncio.sleep
+
+        self._dashboard_lock = threading.Lock()
+        self._last_dashboard_write = float("-inf")
+        self._dashboard_dirty = False
+        self._dashboard_timer: Optional[threading.Timer] = None
+        self._last_dashboard_build_seconds = 0.0
+
+        self.async_sinks: bool = bool(async_sinks)
+        self._sink_queue_size = max(1, int(sink_queue_size))
+        self._sink_queue: "Optional[queue.Queue[CallRecord]]" = None
+        self._sink_pid: Optional[int] = None
+        self._sink_start_lock = threading.Lock()
+        _LIVE_TALLIES.add(self)
+
+    # -------------------------------------------------------------------------
+    # Per-call Metadata, Sinks & Retry Config Helpers
+    # -------------------------------------------------------------------------
+    @contextlib.contextmanager
+    def context(self, **metadata: Any) -> Iterator[Dict[str, Any]]:
+        """
+        Attach metadata (e.g. `user_id`, `tenant`, `request_id`) to every call made inside
+        the block, including calls made through decorators. Nested blocks merge; safe across
+        threads and asyncio tasks:
+
+            with tally.context(user_id=user.id, prompt_version="v3"):
+                answer = ask_llm(question)
+        """
+        merged = {**_CONTEXT_METADATA.get(), **metadata}
+        token = _CONTEXT_METADATA.set(merged)
+        try:
+            yield merged
+        finally:
+            _CONTEXT_METADATA.reset(token)
+
+    def _resolve_metadata(self, explicit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge metadata: instance defaults < `tally.context(...)` < decorator / `run(metadata=...)`."""
+        return {**self.metadata, **_CONTEXT_METADATA.get(), **(explicit or {})}
+
+    @staticmethod
+    def wrap_context(func: F) -> F:
+        """
+        Carry the current `tally.context(...)` metadata into another thread. `contextvars`
+        are not inherited by `ThreadPoolExecutor` / `threading.Thread` workers, so wrap the
+        function you submit:
+
+            with tally.context(user_id="alice"):
+                pool.map(tally.wrap_context(ask_llm), prompts)
+        """
+        captured = _CONTEXT_METADATA.get()
+
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def _async_bound(*args: Any, **kwargs: Any) -> Any:
+                token = _CONTEXT_METADATA.set({**_CONTEXT_METADATA.get(), **captured})
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    _CONTEXT_METADATA.reset(token)
+
+            return _async_bound  # type: ignore[return-value]
+
+        @functools.wraps(func)
+        def _bound(*args: Any, **kwargs: Any) -> Any:
+            token = _CONTEXT_METADATA.set({**_CONTEXT_METADATA.get(), **captured})
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _CONTEXT_METADATA.reset(token)
+
+        return _bound  # type: ignore[return-value]
+
+    def add_sink(self, sink: RecordSink) -> None:
+        """Register a callable that receives every finished `CallRecord`."""
+        self.sinks.append(sink)
+
+    def _deliver_to_sinks(self, record: CallRecord) -> None:
+        for sink in list(self.sinks):
+            try:
+                sink(record)
+            except Exception as sink_exc:
+                self._warn(f"llm-tally record sink {sink!r} raised: {sink_exc}")
+
+    def _emit_to_sinks(self, record: CallRecord) -> None:
+        if not self.sinks:
+            return
+        if not self.async_sinks:
+            self._deliver_to_sinks(record)
+            return
+        sink_queue = self._ensure_sink_worker()
+        try:
+            sink_queue.put_nowait(record)
+        except queue.Full:
+            self._warn(
+                f"llm-tally sink queue is full ({self._sink_queue_size} records); "
+                f"dropped record {record.id}. Sinks are slower than your LLM traffic."
+            )
+
+    def _ensure_sink_worker(self) -> "queue.Queue[CallRecord]":
+        """Start (or, after `fork()`, restart) the background sink thread."""
+        with self._sink_start_lock:
+            if self._sink_queue is None or self._sink_pid != os.getpid():
+                sink_queue: "queue.Queue[CallRecord]" = queue.Queue(maxsize=self._sink_queue_size)
+                worker = threading.Thread(
+                    target=self._sink_worker_loop,
+                    args=(sink_queue,),
+                    name="llm-tally-sinks",
+                    daemon=True,
+                )
+                self._sink_queue = sink_queue
+                self._sink_pid = os.getpid()
+                worker.start()
+            return self._sink_queue
+
+    def _sink_worker_loop(self, sink_queue: "queue.Queue[CallRecord]") -> None:
+        while True:
+            record = sink_queue.get()
+            try:
+                self._deliver_to_sinks(record)
+            finally:
+                sink_queue.task_done()
+
+    def _drain_sinks(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for queued sink deliveries. Returns True if drained."""
+        sink_queue = self._sink_queue
+        if sink_queue is None or self._sink_pid != os.getpid():
+            return True
+        deadline = time.monotonic() + timeout
+        while sink_queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
+    # -------------------------------------------------------------------------
+    # Privacy: previews, error text, and config redaction
+    # -------------------------------------------------------------------------
+    def _safe_redact(self, text: str) -> str:
+        if self.redact is None:
+            return text
+        try:
+            return str(self.redact(text))
+        except Exception as exc:
+            self._warn(
+                f"llm-tally redact function raised {type(exc).__name__}: {exc}; "
+                "stored '[redaction failed]' instead of the text"
+            )
+            return "[redaction failed]"
+
+    def _preview(self, value: Any) -> str:
+        if not self.log_previews:
+            return ""
+        return format_preview(value, redact=self._safe_redact if self.redact else None)
+
+    def _scrub_error(self, message: Optional[str]) -> Optional[str]:
+        """Hide (log_previews=False) and/or redact error text, keeping the exception type."""
+        if message is None:
+            return None
+        if not self.log_previews:
+            head, sep, _ = message.partition(":")
+            if sep:
+                message = f"{head}: [message hidden: log_previews=False]"
+        return self._safe_redact(message)
+
+    def _scrub_attempts(self, attempts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self.log_previews and self.redact is None:
+            return attempts
+        scrubbed = []
+        for attempt in attempts:
+            item = dict(attempt)
+            if isinstance(item.get("message"), str):
+                item["message"] = (
+                    "[message hidden: log_previews=False]"
+                    if not self.log_previews
+                    else self._safe_redact(item["message"])
+                )
+            scrubbed.append(item)
+        return scrubbed
+
+    def _redact_obj(self, value: Any) -> Any:
+        """Apply `redact` to every string inside `config`-like dicts / lists."""
+        if self.redact is None:
+            return value
+        if isinstance(value, str):
+            return self._safe_redact(value)
+        if isinstance(value, dict):
+            return {k: self._redact_obj(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._redact_obj(v) for v in value]
+        return value
+
+    def _retry_config(
+        self,
+        enabled: bool,
+        retries: int,
+        delays: Tuple[float, ...],
+        extra_exceptions: Tuple[Type[BaseException], ...],
+    ) -> RetryConfig:
+        return RetryConfig(
+            enabled=enabled,
+            retries=retries,
+            delays=delays,
+            extra_exceptions=extra_exceptions,
+            retry_on_rate_limit=self.retry_on_rate_limit,
+            jitter=self.retry_jitter,
+            max_retry_after=self.max_retry_after,
+        )
+
+    def load_pricing(self, path: Union[str, Path]) -> int:
+        """Load model prices from a JSON file (see `PricingRegistry.load_file`)."""
+        return self.pricing.load_file(path)
 
     # -------------------------------------------------------------------------
     # Model Pricing Management
@@ -571,17 +1003,23 @@ class LLMTally:
         feature: Optional[str] = None,
         track_cost: bool = True,
         retry: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
         Feature 1 Explicit Function: Execute `func(*args, **kwargs)` using the local
-        in-memory cache.
+        in-memory cache (always on here, regardless of `default_cache_enabled`).
+        With `track_cost=False` and `retry=False` nothing is logged; otherwise this is
+        `run(..., cache=True)`.
         """
         if not track_cost and not retry:
             effective_ttl = self.default_ttl if ttl is None else ttl
             effective_max_req = self.default_max_requests if max_requests is None else max_requests
             func_name = self._func_identifier(func)
-            settings_meta = {"config": config or {}, "model": model or self.default_model}
+            settings_meta = {
+                "config": config or {},
+                "model": model or _call_time_model(kwargs) or self.default_model,
+            }
             key, snapshot = build_cache_key(
                 func_name, args, kwargs, settings=settings_meta, func=func
             )
@@ -629,6 +1067,7 @@ class LLMTally:
             ttl=ttl,
             max_requests=max_requests,
             retry=retry,
+            metadata=metadata,
             **kwargs,
         )
 
@@ -641,6 +1080,7 @@ class LLMTally:
         model: Optional[str] = None,
         track_cost: bool = True,
         retry: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Callable[[F], F]:
         """
         Feature 1 Decorator: Wrap a function with the self-evicting local in-memory cache.
@@ -661,6 +1101,7 @@ class LLMTally:
                         model=model,
                         track_cost=track_cost,
                         retry=retry,
+                        metadata=metadata,
                         **kwargs,
                     )
 
@@ -678,6 +1119,7 @@ class LLMTally:
                     model=model,
                     track_cost=track_cost,
                     retry=retry,
+                    metadata=metadata,
                     **kwargs,
                 )
 
@@ -701,7 +1143,7 @@ class LLMTally:
         Feature 2 Explicit Function: Execute `func(*args, **kwargs)` with automatic
         retries on HTTP 500/5xx or network issues.
         """
-        cfg = RetryConfig(
+        cfg = self._retry_config(
             enabled=True,
             retries=self.default_retries if retries is None else retries,
             delays=self.retry_delays if retry_delays is None else tuple(retry_delays),
@@ -747,6 +1189,7 @@ class LLMTally:
         extra_exceptions: Tuple[Type[BaseException], ...] = (),
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Callable[[F], F]:
         """
         Unified decorator combining:
@@ -778,6 +1221,7 @@ class LLMTally:
                         extra_exceptions=extra_exceptions,
                         explicit_input_tokens=input_tokens,
                         explicit_output_tokens=output_tokens,
+                        metadata=metadata,
                     )
 
                 return _async_wrapped  # type: ignore[return-value]
@@ -800,6 +1244,7 @@ class LLMTally:
                     extra_exceptions=extra_exceptions,
                     explicit_input_tokens=input_tokens,
                     explicit_output_tokens=output_tokens,
+                    metadata=metadata,
                 )
 
             return _sync_wrapped  # type: ignore[return-value]
@@ -822,6 +1267,7 @@ class LLMTally:
         extra_exceptions: Tuple[Type[BaseException], ...] = (),
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """Execute `func(*args, **kwargs)` directly with caching, retries, and cost tracking."""
@@ -843,6 +1289,7 @@ class LLMTally:
                 extra_exceptions=extra_exceptions,
                 explicit_input_tokens=input_tokens,
                 explicit_output_tokens=output_tokens,
+                metadata=metadata,
             )
         return self._execute_sync(
             func=func,
@@ -860,6 +1307,7 @@ class LLMTally:
             extra_exceptions=extra_exceptions,
             explicit_input_tokens=input_tokens,
             explicit_output_tokens=output_tokens,
+            metadata=metadata,
         )
 
     # -------------------------------------------------------------------------
@@ -885,6 +1333,7 @@ class LLMTally:
         explicit_output_tokens: Optional[int],
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Log an initial `CallRecord` immediately (so un-iterated streams are never missed)
@@ -924,11 +1373,20 @@ class LLMTally:
             args=args,
             kwargs=kwargs,
             response="<stream>",
+            metadata=metadata,
+            # Sinks get the finished record from the proxy, not this placeholder
+            emit=False,
         )
         rec_id = rec.id if rec is not None else uuid.uuid4().hex[:12]
         rec_ts = rec.timestamp if rec is not None else datetime.now(timezone.utc).isoformat()
 
-        if inspect.isasyncgen(stream) or hasattr(stream, "__anext__") or hasattr(stream, "__aiter__"):
+        is_async_stream = (
+            inspect.isasyncgen(stream)
+            or hasattr(stream, "__anext__")
+            or hasattr(stream, "__aiter__")
+            or (hasattr(stream, "__aenter__") and not hasattr(stream, "__enter__"))
+        )
+        if is_async_stream:
             return _AsyncStreamProxy(
                 stream=stream,
                 tally=self,
@@ -945,6 +1403,7 @@ class LLMTally:
                 explicit_output_tokens=explicit_output_tokens,
                 args=args,
                 kwargs=kwargs,
+                metadata=metadata,
             )
         return _SyncStreamProxy(
             stream=stream,
@@ -962,6 +1421,7 @@ class LLMTally:
             explicit_output_tokens=explicit_output_tokens,
             args=args,
             kwargs=kwargs,
+            metadata=metadata,
         )
 
     def _execute_sync(
@@ -981,6 +1441,7 @@ class LLMTally:
         extra_exceptions: Tuple[Type[BaseException], ...],
         explicit_input_tokens: Optional[int],
         explicit_output_tokens: Optional[int],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         use_cache = self.default_cache_enabled if cache is None else cache
         effective_ttl = self.default_ttl if ttl is None else ttl
@@ -988,7 +1449,11 @@ class LLMTally:
         use_retry = self.default_retry_enabled if retry is None else retry
         effective_retries = self.default_retries if retries is None else retries
         effective_delays = self.retry_delays if retry_delays is None else tuple(retry_delays)
-        chosen_model = model or (config or {}).get("model") or self.default_model
+        call_model = _call_time_model(kwargs)
+        chosen_model = (
+            model or (config or {}).get("model") or call_model or self.default_model
+        )
+        meta = self._resolve_metadata(metadata)
         cfg_dict = dict(config or {})
 
         func_id = self._func_identifier(func)
@@ -1024,11 +1489,12 @@ class LLMTally:
                     args=args,
                     kwargs=kwargs,
                     response=cached_output,
+                    metadata=meta,
                 )
                 return cached_output
 
         # 2. Execute with Retry Engine
-        retry_cfg = RetryConfig(
+        retry_cfg = self._retry_config(
             enabled=use_retry,
             retries=effective_retries,
             delays=effective_delays,
@@ -1063,6 +1529,7 @@ class LLMTally:
                 args=args,
                 kwargs=kwargs,
                 response=None,
+                metadata=meta,
             )
             raise
         except BaseException as exc:
@@ -1087,6 +1554,7 @@ class LLMTally:
                 args=args,
                 kwargs=kwargs,
                 response=None,
+                metadata=meta,
             )
             raise
 
@@ -1105,6 +1573,7 @@ class LLMTally:
                 explicit_output_tokens=explicit_output_tokens,
                 args=args,
                 kwargs=kwargs,
+                metadata=meta,
             )
 
         latency_ms = (time.perf_counter() - start_perf) * 1000.0
@@ -1127,7 +1596,14 @@ class LLMTally:
             explicit_output_tokens if explicit_output_tokens is not None else usage.output_tokens
         )
         final_model = str(
-            model or cfg_dict.get("model") or usage.detected_model or self.default_model
+            model
+            or cfg_dict.get("model")
+            or usage.detected_model
+            or call_model
+            or self.default_model
+        )
+        estimated = usage.estimated and not (
+            explicit_input_tokens is not None and explicit_output_tokens is not None
         )
         cost_usd = self._safe_calculate_cost(
             model=final_model,
@@ -1157,6 +1633,8 @@ class LLMTally:
             args=args,
             kwargs=kwargs,
             response=result,
+            metadata=meta,
+            estimated_tokens=estimated,
         )
         return result
 
@@ -1177,6 +1655,7 @@ class LLMTally:
         extra_exceptions: Tuple[Type[BaseException], ...],
         explicit_input_tokens: Optional[int],
         explicit_output_tokens: Optional[int],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         use_cache = self.default_cache_enabled if cache is None else cache
         effective_ttl = self.default_ttl if ttl is None else ttl
@@ -1184,7 +1663,11 @@ class LLMTally:
         use_retry = self.default_retry_enabled if retry is None else retry
         effective_retries = self.default_retries if retries is None else retries
         effective_delays = self.retry_delays if retry_delays is None else tuple(retry_delays)
-        chosen_model = model or (config or {}).get("model") or self.default_model
+        call_model = _call_time_model(kwargs)
+        chosen_model = (
+            model or (config or {}).get("model") or call_model or self.default_model
+        )
+        meta = self._resolve_metadata(metadata)
         cfg_dict = dict(config or {})
 
         func_id = self._func_identifier(func)
@@ -1220,11 +1703,12 @@ class LLMTally:
                     args=args,
                     kwargs=kwargs,
                     response=cached_output,
+                    metadata=meta,
                 )
                 return cached_output
 
         # 2. Execute with Async Retry Engine
-        retry_cfg = RetryConfig(
+        retry_cfg = self._retry_config(
             enabled=use_retry,
             retries=effective_retries,
             delays=effective_delays,
@@ -1259,6 +1743,7 @@ class LLMTally:
                 args=args,
                 kwargs=kwargs,
                 response=None,
+                metadata=meta,
             )
             raise
         except BaseException as exc:
@@ -1283,6 +1768,7 @@ class LLMTally:
                 args=args,
                 kwargs=kwargs,
                 response=None,
+                metadata=meta,
             )
             raise
 
@@ -1301,6 +1787,7 @@ class LLMTally:
                 explicit_output_tokens=explicit_output_tokens,
                 args=args,
                 kwargs=kwargs,
+                metadata=meta,
             )
 
         latency_ms = (time.perf_counter() - start_perf) * 1000.0
@@ -1323,7 +1810,14 @@ class LLMTally:
             explicit_output_tokens if explicit_output_tokens is not None else usage.output_tokens
         )
         final_model = str(
-            model or cfg_dict.get("model") or usage.detected_model or self.default_model
+            model
+            or cfg_dict.get("model")
+            or usage.detected_model
+            or call_model
+            or self.default_model
+        )
+        estimated = usage.estimated and not (
+            explicit_input_tokens is not None and explicit_output_tokens is not None
         )
         cost_usd = self._safe_calculate_cost(
             model=final_model,
@@ -1353,6 +1847,8 @@ class LLMTally:
             args=args,
             kwargs=kwargs,
             response=result,
+            metadata=meta,
+            estimated_tokens=estimated,
         )
         return result
 
@@ -1376,43 +1872,36 @@ class LLMTally:
         kwargs: Dict[str, Any],
         response: Any,
         cache_creation_input_tokens: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+        estimated_tokens: bool = False,
+        emit: bool = True,
     ) -> Optional[CallRecord]:
-        try:
-            record = CallRecord(
-                id=uuid.uuid4().hex[:12],
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                feature=feature,
-                function_name=function_name,
-                model=model,
-                config=config,
-                status=status,
-                cache_hit=cache_hit,
-                latency_ms=round(latency_ms, 2),
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
-                cost_usd=cost_usd,
-                retries=retries,
-                error_message=error_message,
-                attempt_errors=attempt_errors,
-                input_preview=format_preview({"args": args, "kwargs": kwargs}),
-                output_preview=format_preview(response),
-                cache_creation_input_tokens=cache_creation_input_tokens,
-            )
-            self.logger.append(record)
-            if self.auto_update_dashboard:
-                self.generate_dashboard()
-            return record
-        except Exception as log_exc:
-            try:
-                warnings.warn(
-                    f"llm-tally failed to write telemetry log or dashboard: {log_exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            except Warning:
-                pass
-            return None
+        return self._persist_record(
+            record_id=uuid.uuid4().hex[:12],
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            update=False,
+            emit=emit,
+            feature=feature,
+            function_name=function_name,
+            model=model,
+            config=config,
+            status=status,
+            cache_hit=cache_hit,
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            cost_usd=cost_usd,
+            retries=retries,
+            error_message=error_message,
+            attempt_errors=attempt_errors,
+            args=args,
+            kwargs=kwargs,
+            response=response,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            metadata=metadata,
+            estimated_tokens=estimated_tokens,
+        )
 
     def _update_recorded_call(
         self,
@@ -1436,82 +1925,193 @@ class LLMTally:
         kwargs: Dict[str, Any],
         response: Any,
         cache_creation_input_tokens: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+        estimated_tokens: bool = False,
     ) -> Optional[CallRecord]:
+        return self._persist_record(
+            record_id=record_id,
+            timestamp=timestamp,
+            update=True,
+            emit=True,
+            feature=feature,
+            function_name=function_name,
+            model=model,
+            config=config,
+            status=status,
+            cache_hit=cache_hit,
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            cost_usd=cost_usd,
+            retries=retries,
+            error_message=error_message,
+            attempt_errors=attempt_errors,
+            args=args,
+            kwargs=kwargs,
+            response=response,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            metadata=metadata,
+            estimated_tokens=estimated_tokens,
+        )
+
+    def _persist_record(
+        self,
+        record_id: str,
+        timestamp: str,
+        update: bool,
+        emit: bool,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        response: Any,
+        metadata: Optional[Dict[str, Any]],
+        latency_ms: float,
+        **fields: Any,
+    ) -> Optional[CallRecord]:
+        """
+        Build a `CallRecord`, append it (or update it in place for streams), refresh the
+        dashboard if due, and hand it to the sinks. Telemetry failures only warn.
+        """
         try:
+            fields["error_message"] = self._scrub_error(fields.get("error_message"))
+            fields["attempt_errors"] = self._scrub_attempts(list(fields.get("attempt_errors") or []))
+            fields["config"] = self._redact_obj(dict(fields.get("config") or {}))
             record = CallRecord(
                 id=record_id,
                 timestamp=timestamp,
-                feature=feature,
-                function_name=function_name,
-                model=model,
-                config=config,
-                status=status,
-                cache_hit=cache_hit,
                 latency_ms=round(latency_ms, 2),
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
-                cost_usd=cost_usd,
-                retries=retries,
-                error_message=error_message,
-                attempt_errors=attempt_errors,
-                input_preview=format_preview({"args": args, "kwargs": kwargs}),
-                output_preview=format_preview(response),
-                cache_creation_input_tokens=cache_creation_input_tokens,
+                input_preview=self._preview({"args": args, "kwargs": kwargs}),
+                output_preview=self._preview(response),
+                metadata=dict(metadata or {}),
+                **fields,
             )
-            self.logger.update(record)
-            if self.auto_update_dashboard:
-                self.generate_dashboard()
-            return record
-        except Exception as log_exc:
-            try:
-                warnings.warn(
-                    f"llm-tally failed to update stream telemetry log: {log_exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            except Warning:
-                pass
+        except Exception as build_exc:
+            self._warn(f"llm-tally failed to build telemetry record: {build_exc}")
             return None
+
+        if self.persist_logs:
+            try:
+                if update:
+                    self.logger.update(record)
+                else:
+                    self.logger.append(record)
+                self._maybe_update_dashboard()
+            except Exception as log_exc:
+                verb = "update stream telemetry log" if update else "write telemetry log or dashboard"
+                self._warn(f"llm-tally failed to {verb}: {log_exc}")
+                return None
+        if emit:
+            self._emit_to_sinks(record)
+        return record
+
+    @staticmethod
+    def _warn(message: str) -> None:
+        try:
+            warnings.warn(message, RuntimeWarning, stacklevel=4)
+        except Warning:
+            pass
+
+    def _maybe_update_dashboard(self) -> None:
+        """
+        Regenerate the dashboard, at most once per `dashboard_update_interval` seconds.
+        A skipped update is written by a background timer when the interval ends.
+        """
+        if not self.auto_update_dashboard:
+            return
+        with self._dashboard_lock:
+            now = time.monotonic()
+            interval = self.dashboard_update_interval
+            if interval > 0:
+                # Never spend more than ~10% of the time rebuilding a large dashboard
+                interval = max(interval, 10.0 * self._last_dashboard_build_seconds)
+            remaining = interval - (now - self._last_dashboard_write)
+            if interval > 0 and remaining > 0:
+                self._dashboard_dirty = True
+                if self._dashboard_timer is None:
+                    timer = threading.Timer(remaining, self._flush_from_timer)
+                    timer.daemon = True
+                    self._dashboard_timer = timer
+                    timer.start()
+                return
+            self._last_dashboard_write = now
+            self._dashboard_dirty = False
+        self.generate_dashboard()
+
+    def _flush_from_timer(self) -> None:
+        with self._dashboard_lock:
+            self._dashboard_timer = None
+        try:
+            self.flush()
+        except Exception as exc:
+            self._warn(f"llm-tally failed to write dashboard: {exc}")
+
+    def flush(self, sink_timeout: float = 5.0) -> Optional[Path]:
+        """
+        Deliver queued `async_sinks` records (waiting up to `sink_timeout` seconds) and write any
+        dashboard update skipped by throttling. Returns the dashboard path, or None if no update
+        was pending. Runs automatically after the throttle interval and at interpreter exit.
+        """
+        self._drain_sinks(sink_timeout)
+        with self._dashboard_lock:
+            if not self._dashboard_dirty:
+                return None
+            self._dashboard_dirty = False
+            self._last_dashboard_write = time.monotonic()
+        if not self.log_path.exists():
+            # Log was cleared or its directory removed; don't recreate it with an empty dashboard
+            return None
+        return self.generate_dashboard()
 
     # -------------------------------------------------------------------------
     # Feature 3: Analytics & Dashboard Generation
     # -------------------------------------------------------------------------
-    def get_records(self) -> List[CallRecord]:
-        """Read all logged call records from the JSONL file."""
-        return self.logger.read_all()
+    def get_records(self, days: Optional[float] = None) -> List[CallRecord]:
+        """Read logged call records from the JSONL file (only the last `days` days if given)."""
+        return filter_records_since(self.logger.read_all(), days)
 
-    def get_report(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+    def get_report(
+        self,
+        now: Optional[datetime] = None,
+        days: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Return the full analytics dictionary answering:
         - `spend_summary["this_week_usd"]`: How much money did I spend this week?
         - `feature_costs`: Which feature (per config) costs the most?
         - `failure_stats`: Which calls fail the most?
         - `latency_stats` / `slowest_calls`: Which calls are slow?
+        - `metadata_costs`: Which user / tenant / prompt version (any metadata key) costs the most?
         """
-        records = self.logger.read_all()
+        records = filter_records_since(self.logger.read_all(copy_records=False), days, now=now)
         return analyze_logs(records, now=now)
 
     def render_dashboard(
         self,
-        title: str = "llm-tally — Cost & Reliability Dashboard",
+        title: str = DEFAULT_DASHBOARD_TITLE,
+        days: Optional[float] = None,
     ) -> str:
         """Render the self-contained HTML dashboard as a string."""
-        records = self.logger.read_all()
+        window = self.dashboard_days if days is None else days
+        records = filter_records_since(self.logger.read_all(copy_records=False), window)
         return render_dashboard_html(records, title=title)
 
     def generate_dashboard(
         self,
-        dashboard_path: Optional[str | Path] = None,
-        title: str = "llm-tally — Cost & Reliability Dashboard",
+        dashboard_path: Optional[Union[str, Path]] = None,
+        title: str = DEFAULT_DASHBOARD_TITLE,
+        days: Optional[float] = None,
     ) -> Path:
         """Write/update the static HTML dashboard file on disk and return its path."""
         target = Path(dashboard_path) if dashboard_path is not None else self.dashboard_path
-        records = self.logger.read_all()
-        return write_dashboard_file(records, dashboard_path=target, title=title)
+        window = self.dashboard_days if days is None else days
+        started = time.perf_counter()
+        records = filter_records_since(self.logger.read_all(copy_records=False), window)
+        path = write_dashboard_file(records, dashboard_path=target, title=title)
+        self._last_dashboard_build_seconds = time.perf_counter() - started
+        return path
 
     def clear_cache(self) -> None:
-        """Clear all entries from the in-memory cache."""
+        """Clear all entries from the cache."""
         self.cache_store.clear()
 
     def clear_logs(self) -> None:

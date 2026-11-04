@@ -1,9 +1,13 @@
 """
-Feature 2: Resilient Retry Engine for HTTP 500/5xx & Network Failures.
+Feature 2: Resilient Retry Engine for HTTP 500/5xx, 429 Rate Limits & Network Failures.
 
 Default behavior:
-- On failed attempts caused by an HTTP 500/5xx status or network/timeout issue,
-  retries 3 times with delays of 0.5s, 1.0s, and 1.5s (4 total attempts: 1 initial + 3 retries).
+- On failed attempts caused by an HTTP 500/5xx status, an HTTP 429 rate limit, or a
+  network/timeout issue, retries 3 times with delays of 0.5s, 1.0s, and 1.5s
+  (4 total attempts: 1 initial + 3 retries).
+- A server-provided `Retry-After` / `retry-after-ms` header (or `retry_after` attribute)
+  extends the wait, capped at `max_retry_after` seconds.
+- Optional `jitter` adds up to `jitter * delay` random extra wait to spread out retries.
 - If all attempts fail, raises `RetryExhaustedError` containing the complete list of
   errors from every attempt.
 """
@@ -11,11 +15,13 @@ Default behavior:
 from __future__ import annotations
 
 import asyncio
+import random
 import socket
 import time
 import urllib.error
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 DEFAULT_RETRY_DELAYS: Tuple[float, ...] = (0.5, 1.0, 1.5)
@@ -55,15 +61,28 @@ _SERVER_ERROR_EXCEPTION_NAMES = frozenset(
     }
 )
 
+_RATE_LIMIT_EXCEPTION_NAMES = frozenset(
+    {
+        "RateLimitError",
+        "RateLimitExceeded",
+        "TooManyRequests",
+        "TooManyRequestsError",
+        "ResourceExhausted",
+    }
+)
+
 
 @dataclass
 class RetryConfig:
-    """Configuration for automatic retries on 500/5xx and network failures."""
+    """Configuration for automatic retries on 500/5xx, 429 rate limits, and network failures."""
 
     enabled: bool = True
     retries: int = 3
     delays: Tuple[float, ...] = DEFAULT_RETRY_DELAYS
     extra_exceptions: Tuple[Type[BaseException], ...] = ()
+    retry_on_rate_limit: bool = True
+    jitter: float = 0.0
+    max_retry_after: float = 60.0
 
     def get_delay_for_retry(self, retry_index: int) -> float:
         """
@@ -75,6 +94,20 @@ class RetryConfig:
         if retry_index < len(self.delays):
             return float(self.delays[retry_index])
         return float(self.delays[-1])
+
+    def compute_wait(self, retry_index: int, exc: Optional[BaseException] = None) -> float:
+        """
+        Return the actual wait before retry `retry_index`: the configured delay, extended by a
+        server `Retry-After` hint from `exc` (capped at `max_retry_after`), plus optional jitter.
+        """
+        delay = self.get_delay_for_retry(retry_index)
+        if exc is not None:
+            hint = extract_retry_after(exc)
+            if hint is not None:
+                delay = max(delay, min(hint, float(self.max_retry_after)))
+        if self.jitter > 0 and delay > 0:
+            delay += random.uniform(0.0, delay * float(self.jitter))
+        return delay
 
 
 @dataclass
@@ -172,12 +205,66 @@ def extract_status_code(exc_or_obj: Any) -> Optional[int]:
     return None
 
 
+def _header_value(headers: Any, name: str) -> Optional[str]:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        val = getter(name)
+        if val is None and isinstance(headers, dict):
+            lowered = {str(k).lower(): v for k, v in headers.items()}
+            val = lowered.get(name)
+    except Exception:
+        return None
+    return None if val is None else str(val)
+
+
+def extract_retry_after(exc: BaseException) -> Optional[float]:
+    """
+    Return the server-requested wait in seconds from `exc.retry_after`, or from the
+    `retry-after-ms` / `retry-after` header of `exc.response` (seconds or HTTP-date).
+    """
+    attr = getattr(exc, "retry_after", None)
+    if isinstance(attr, (int, float)) and not isinstance(attr, bool) and attr >= 0:
+        return float(attr)
+
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+
+    ms_val = _header_value(headers, "retry-after-ms")
+    if ms_val is not None:
+        try:
+            return max(0.0, float(ms_val) / 1000.0)
+        except ValueError:
+            pass
+
+    raw = _header_value(headers, "retry-after")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def is_retryable_exception(
     exc: BaseException,
     extra_exceptions: Tuple[Type[BaseException], ...] = (),
+    retry_on_rate_limit: bool = True,
 ) -> Tuple[bool, Optional[int]]:
     """
-    Determine whether `exc` represents an HTTP 500/5xx error or a network/timeout issue.
+    Determine whether `exc` represents an HTTP 500/5xx error, an HTTP 429 rate limit
+    (when `retry_on_rate_limit` is True), or a network/timeout issue.
 
     Returns:
         Tuple of `(should_retry: bool, status_code: Optional[int])`.
@@ -193,9 +280,14 @@ def is_retryable_exception(
     if status_code is not None:
         if 500 <= status_code <= 599:
             return True, status_code
+        if status_code == 429:
+            return retry_on_rate_limit, status_code
         # Explicit 4xx client errors (400, 401, 403, 404, 422) should not be retried
         if 400 <= status_code < 500:
             return False, status_code
+
+    if any(base.__name__ in _RATE_LIMIT_EXCEPTION_NAMES for base in type(exc).__mro__):
+        return retry_on_rate_limit, status_code
 
     # Standard Python network & timeout exceptions
     if isinstance(
@@ -224,7 +316,9 @@ def is_retryable_exception(
     # Inspect ONLY explicit chained cause (`raise X from cause`), NEVER implicit `__context__`
     cause = exc.__cause__
     if cause is not None and cause is not exc:
-        cause_retryable, cause_status = is_retryable_exception(cause, extra_exceptions)
+        cause_retryable, cause_status = is_retryable_exception(
+            cause, extra_exceptions, retry_on_rate_limit
+        )
         if cause_retryable:
             return True, status_code or cause_status
 
@@ -289,10 +383,11 @@ def execute_with_retry_sync(
     total_attempts = 1 + max_retries
     func_name = getattr(func, "__qualname__", getattr(func, "__name__", "llm_call"))
     failures: List[AttemptFailure] = []
+    next_delay = 0.0
 
     for attempt_idx in range(total_attempts):
         attempt_num = attempt_idx + 1
-        delay_before = 0.0 if attempt_idx == 0 else cfg.get_delay_for_retry(attempt_idx - 1)
+        delay_before = 0.0 if attempt_idx == 0 else next_delay
         if delay_before > 0:
             sleep_func(delay_before)
 
@@ -305,7 +400,9 @@ def execute_with_retry_sync(
             if isinstance(exc, _NON_RETRYABLE_BASE_EXCEPTIONS):
                 raise
             duration_ms = (time.perf_counter() - start) * 1000.0
-            should_retry, status_code = is_retryable_exception(exc, cfg.extra_exceptions)
+            should_retry, status_code = is_retryable_exception(
+                exc, cfg.extra_exceptions, cfg.retry_on_rate_limit
+            )
             failure = AttemptFailure(
                 attempt=attempt_num,
                 error_type=type(exc).__name__,
@@ -325,6 +422,7 @@ def execute_with_retry_sync(
                 raise
             if attempt_num >= total_attempts:
                 raise RetryExhaustedError(attempts=failures, func_name=func_name) from exc
+            next_delay = cfg.compute_wait(attempt_idx, exc)
 
     raise RetryExhaustedError(attempts=failures, func_name=func_name)
 
@@ -355,10 +453,11 @@ async def execute_with_retry_async(
     total_attempts = 1 + max_retries
     func_name = getattr(func, "__qualname__", getattr(func, "__name__", "llm_call"))
     failures: List[AttemptFailure] = []
+    next_delay = 0.0
 
     for attempt_idx in range(total_attempts):
         attempt_num = attempt_idx + 1
-        delay_before = 0.0 if attempt_idx == 0 else cfg.get_delay_for_retry(attempt_idx - 1)
+        delay_before = 0.0 if attempt_idx == 0 else next_delay
         if delay_before > 0:
             await sleep_func(delay_before)
 
@@ -371,7 +470,9 @@ async def execute_with_retry_async(
             if isinstance(exc, _NON_RETRYABLE_BASE_EXCEPTIONS):
                 raise
             duration_ms = (time.perf_counter() - start) * 1000.0
-            should_retry, status_code = is_retryable_exception(exc, cfg.extra_exceptions)
+            should_retry, status_code = is_retryable_exception(
+                exc, cfg.extra_exceptions, cfg.retry_on_rate_limit
+            )
             failure = AttemptFailure(
                 attempt=attempt_num,
                 error_type=type(exc).__name__,
@@ -391,5 +492,6 @@ async def execute_with_retry_async(
                 raise
             if attempt_num >= total_attempts:
                 raise RetryExhaustedError(attempts=failures, func_name=func_name) from exc
+            next_delay = cfg.compute_wait(attempt_idx, exc)
 
     raise RetryExhaustedError(attempts=failures, func_name=func_name)

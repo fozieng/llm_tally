@@ -12,9 +12,11 @@ OpenAI fine-tuned (`ft:gpt-4o-...`), and `org/model` identifiers out of the box.
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 
 # Matches version/date/modality/snapshot suffixes without matching distinct tier suffixes (-pro, -mini, -nano, -32k, -turbo, -lite)
@@ -337,3 +339,31 @@ class PricingRegistry:
     def list_models(self) -> Dict[str, ModelPricing]:
         """Return a copy of all registered models and their pricing."""
         return dict(self._catalog)
+
+    def load_file(self, path: "str | Path") -> int:
+        """
+        Register (or override) pricing from a JSON file so prices can be updated without a release:
+
+            {"my-model": {"input_cost_per_1m": 1.2, "output_cost_per_1m": 4.8,
+                          "provider": "custom", "cached_input_cost_per_1m": 0.6}}
+
+        Returns the number of models loaded. Raises `ValueError` on a malformed file.
+        """
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Pricing file {path} must contain a JSON object of model -> rates")
+        for model_name, rates in data.items():
+            if not isinstance(rates, dict):
+                raise ValueError(f"Pricing for '{model_name}' in {path} must be a JSON object")
+            try:
+                self.register(
+                    model=str(model_name),
+                    input_cost_per_1m=float(rates["input_cost_per_1m"]),
+                    output_cost_per_1m=float(rates["output_cost_per_1m"]),
+                    provider=str(rates.get("provider", "custom")),
+                    cached_input_cost_per_1m=rates.get("cached_input_cost_per_1m"),
+                    cache_creation_cost_per_1m=rates.get("cache_creation_cost_per_1m"),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid pricing for '{model_name}' in {path}: {exc}") from exc
+        return len(data)

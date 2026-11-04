@@ -141,6 +141,8 @@ def test_cost_analysis_and_html_dashboard_answers_all_questions(tmp_path: Path |
         assert len(report["latency_stats"]) == 3
 
         # 5. HTML Dashboard generated & contains all required sections + search
+        # (auto-updates are throttled; `flush()` writes the pending update now)
+        tally.flush()
         assert dash_file.exists()
         html_text = dash_file.read_text(encoding="utf-8")
         assert "How much money did I spend this week?" in html_text

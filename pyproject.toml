@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-tally"
-version = "0.1.0"
-description = "Zero-dependency Python LLM toolkit with self-evicting in-memory caching, smart 5xx/network retries, per-feature cost tracking, and an interactive HTML dashboard."
+version = "0.2.0"
+description = "Zero-dependency Python LLM toolkit with self-evicting in-memory caching, smart 5xx/429/network retries, per-feature cost tracking, and an interactive HTML dashboard."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -35,6 +35,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -46,6 +47,9 @@ dev = [
     "build>=1.0.0",
     "twine>=5.0.0",
 ]
+
+[project.scripts]
+llm-tally = "llm_tally.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pal-masgit-hub/llm-tally"

@@ -11,6 +11,7 @@ Persists call logs to a JSONL file and aggregates metrics to answer:
 from __future__ import annotations
 
 import collections.abc
+import copy
 import inspect
 import json
 import math
@@ -20,12 +21,16 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
+
+_LOCK_EX = fcntl.LOCK_EX if fcntl is not None else 0
+_LOCK_SH = fcntl.LOCK_SH if fcntl is not None else 0
+_LOCK_UN = fcntl.LOCK_UN if fcntl is not None else 0
 
 
 @dataclass
@@ -55,7 +60,7 @@ class CallRecord:
     function_name: str
     model: str
     config: Dict[str, Any]
-    status: str  # "success", "cached", "failed"
+    status: str  # "success", "cached", "failed", "incomplete"
     cache_hit: bool
     latency_ms: float
     input_tokens: int
@@ -68,6 +73,10 @@ class CallRecord:
     input_preview: str = ""
     output_preview: str = ""
     cache_creation_input_tokens: int = 0
+    # True when token counts (and therefore cost) were guessed from text length
+    estimated_tokens: bool = False
+    # Free-form per-call tags such as `user_id`, `tenant`, or `prompt_version`
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -94,6 +103,8 @@ class CallRecord:
             input_preview=str(data.get("input_preview") or ""),
             output_preview=str(data.get("output_preview") or ""),
             cache_creation_input_tokens=int(data.get("cache_creation_input_tokens", 0)),
+            estimated_tokens=bool(data.get("estimated_tokens", False)),
+            metadata=dict(data.get("metadata") or {}),
         )
 
 
@@ -280,8 +291,15 @@ def extract_token_usage(
     )
 
 
-def format_preview(value: Any, max_len: int = 140) -> str:
-    """Create a short human-readable preview string of an input or output for search & inspection."""
+def format_preview(
+    value: Any,
+    max_len: int = 140,
+    redact: Optional[Callable[[str], str]] = None,
+) -> str:
+    """
+    Create a short human-readable preview string of an input or output for search & inspection.
+    `redact` (if given) is applied to the full text before truncation.
+    """
     if value is None:
         return ""
     if inspect.isgenerator(value) or inspect.isasyncgen(value) or isinstance(
@@ -295,6 +313,8 @@ def format_preview(value: Any, max_len: int = 140) -> str:
             text = json.dumps(value, default=str, ensure_ascii=False)
         except Exception:
             text = repr(value)
+    if redact is not None:
+        text = str(redact(text))
     text = " ".join(text.split())
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
@@ -316,160 +336,218 @@ def _write_all(fd: int, payload: bytes) -> None:
         written += os.write(fd, view[written:])
 
 
-def _read_all_bytes(fd: int) -> bytes:
-    os.lseek(fd, 0, os.SEEK_SET)
-    chunks: List[bytes] = []
-    while True:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b"".join(chunks)
+def _clone_record(rec: CallRecord) -> CallRecord:
+    """Copy a record (and its mutable fields) so callers can't corrupt the read cache."""
+    clone = copy.copy(rec)
+    clone.config = dict(rec.config)
+    clone.metadata = dict(rec.metadata)
+    clone.attempt_errors = list(rec.attempt_errors)
+    return clone
 
 
 class JSONLLogger:
     """
-    Thread-safe and multiprocess-safe JSONL reader and writer for `CallRecord` events.
+    Thread-safe and multiprocess-safe, append-only JSONL reader and writer for `CallRecord` events.
 
-    Coordinates concurrent threads (`threading.RLock`) and concurrent worker processes
-    (`fcntl.flock` on the shared log file descriptor without `O_TRUNC` on open) so
-    both `append()` and in-place `update()` preserve every record under multiprocess load.
+    - Every write is a single appended line under an exclusive `fcntl.flock`, so concurrent
+      threads and worker processes never lose records. Writers re-check the file's inode after
+      locking so they never append to a file another process just rotated away.
+    - `update()` appends the new version of a record; readers keep the **last** line for each
+      `id` (stream calls therefore occupy two lines: a placeholder and the final record).
+      `compact()` rewrites the file with one line per record.
+    - `read_all()` is incremental: it remembers what it already parsed and only reads bytes
+      appended since the previous call.
+    - Optional rotation: when the file would exceed `max_bytes`, it is renamed to
+      `<name>.1` (older backups shift to `.2`, ... up to `backups`) and a new file is started.
     """
 
-    def __init__(self, log_path: str | Path = ".llm_tally/logs.jsonl") -> None:
+    def __init__(
+        self,
+        log_path: str | Path = ".llm_tally/logs.jsonl",
+        max_bytes: Optional[int] = None,
+        backups: int = 3,
+    ) -> None:
         self.log_path = Path(log_path)
+        self.max_bytes = int(max_bytes) if max_bytes else None
+        self.backups = max(0, int(backups))
         self._lock = threading.RLock()
+        self._reset_cache()
 
+    # ---- locking helpers ---------------------------------------------------------
+    @staticmethod
+    def _flock(fd: int, mode: int) -> None:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, mode)
+            except OSError:
+                pass
+
+    def _open_locked_for_append(self) -> int:
+        """Open the current log file for appending and hold an exclusive lock on it."""
+        while True:
+            fd = os.open(str(self.log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            self._flock(fd, _LOCK_EX)
+            try:
+                on_disk = os.stat(str(self.log_path))
+                opened = os.fstat(fd)
+                if (on_disk.st_dev, on_disk.st_ino) == (opened.st_dev, opened.st_ino):
+                    return fd
+            except FileNotFoundError:
+                pass
+            # Rotated or replaced between open() and flock(): retry on the new file
+            self._flock(fd, _LOCK_UN)
+            os.close(fd)
+
+    def _rotate_locked(self) -> None:
+        """Shift `log.N` -> `log.N+1` and move the current log to `log.1` (caller holds the lock)."""
+        base = str(self.log_path)
+        if self.backups == 0:
+            os.unlink(base)
+            return
+        for idx in range(self.backups - 1, 0, -1):
+            src = f"{base}.{idx}"
+            if os.path.exists(src):
+                os.replace(src, f"{base}.{idx + 1}")
+        os.replace(base, f"{base}.1")
+
+    # ---- writing -------------------------------------------------------------------
     def _append_line(self, line: str) -> None:
+        payload = (line + "\n").encode("utf-8")
         with self._lock:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = (line + "\n").encode("utf-8")
-            fd = os.open(
-                str(self.log_path),
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o644,
-            )
+            fd = self._open_locked_for_append()
             try:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX)
-                    except OSError:
-                        pass
+                if self.max_bytes is not None:
+                    size = os.fstat(fd).st_size
+                    if size > 0 and size + len(payload) > self.max_bytes:
+                        self._rotate_locked()
+                        self._flock(fd, _LOCK_UN)
+                        os.close(fd)
+                        fd = self._open_locked_for_append()
                 _write_all(fd, payload)
             finally:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
+                self._flock(fd, _LOCK_UN)
                 os.close(fd)
 
     def append(self, record: CallRecord) -> None:
         """Append a single `CallRecord` line to the JSONL log file."""
-        line = _safe_json_dumps(record.to_dict(), sort_keys=False)
-        self._append_line(line)
+        self._append_line(_safe_json_dumps(record.to_dict(), sort_keys=False))
 
     def update(self, record: CallRecord) -> None:
         """
-        Update an existing `CallRecord` (matched by `record.id`) in the JSONL log file,
-        or append it if not found. Holds an exclusive `flock` on the file descriptor across
-        the read-modify-write cycle without ever truncating on open or replacing the inode,
-        preventing record loss across concurrent processes.
+        Record a new version of an existing `CallRecord` (matched by `record.id`).
+        Appends a line instead of rewriting the file, so the cost is O(1) regardless of
+        log size; readers keep the last line per `id`.
         """
-        new_line_bytes = _safe_json_dumps(record.to_dict(), sort_keys=False).encode("utf-8")
-        target_id = record.id
-        id_needle = f'"{target_id}"'.encode("utf-8")
+        self.append(record)
 
-        with self._lock:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(
-                str(self.log_path),
-                os.O_RDWR | os.O_CREAT,
-                0o644,
-            )
-            try:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX)
-                    except OSError:
-                        pass
-
-                raw_bytes = _read_all_bytes(fd)
-                lines = [ln for ln in raw_bytes.splitlines() if ln.strip()]
-                replaced = False
-                for idx in range(len(lines) - 1, -1, -1):
-                    raw_line = lines[idx]
-                    if id_needle not in raw_line:
-                        continue
-                    try:
-                        parsed = json.loads(raw_line.decode("utf-8"))
-                    except Exception:
-                        continue
-                    if isinstance(parsed, dict) and parsed.get("id") == target_id:
-                        lines[idx] = new_line_bytes
-                        replaced = True
-                        break
-
-                if not replaced:
-                    lines.append(new_line_bytes)
-
-                updated_payload = b"\n".join(lines) + b"\n"
-                os.lseek(fd, 0, os.SEEK_SET)
-                _write_all(fd, updated_payload)
-                os.ftruncate(fd, len(updated_payload))
-            finally:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-                os.close(fd)
-
-    def read_all(self) -> List[CallRecord]:
+    def compact(self) -> int:
         """
-        Read all stored `CallRecord` entries from the JSONL log file under a shared file lock,
-        coalescing by `record.id` in original insertion order.
+        Rewrite the log with exactly one line (the latest version) per record id, atomically.
+        Returns the number of records kept.
         """
         with self._lock:
             if not self.log_path.exists():
-                return []
+                return 0
+            fd = self._open_locked_for_append()
+            try:
+                records = self._parse_bytes(_read_all_bytes_from_path(self.log_path))
+                tmp_path = self.log_path.with_name(f".{self.log_path.name}.compact.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    for rec in records.values():
+                        fh.write(_safe_json_dumps(rec.to_dict(), sort_keys=False) + "\n")
+                os.replace(tmp_path, self.log_path)
+            finally:
+                self._flock(fd, _LOCK_UN)
+                os.close(fd)
+            self._reset_cache()
+            return len(records)
+
+    # ---- reading -------------------------------------------------------------------
+    def _reset_cache(self) -> None:
+        self._cache_file_key: Optional[Tuple[int, int]] = None
+        self._cache_offset = 0
+        self._cache_records: Dict[str, CallRecord] = {}
+
+    @staticmethod
+    def _parse_bytes(raw: bytes, into: Optional[Dict[str, CallRecord]] = None) -> Dict[str, CallRecord]:
+        records = {} if into is None else into
+        for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                rec = CallRecord.from_dict(json.loads(stripped))
+            except Exception:
+                continue
+            records[rec.id] = rec
+        return records
+
+    def read_all(self, copy_records: bool = True) -> List[CallRecord]:
+        """
+        Return all stored `CallRecord` entries (latest version per id, in first-seen order).
+        Only bytes appended since the previous call are read and parsed. Pass
+        `copy_records=False` for read-only internal use to skip copying.
+        """
+        with self._lock:
             try:
                 fd = os.open(str(self.log_path), os.O_RDONLY)
             except FileNotFoundError:
+                self._reset_cache()
                 return []
             try:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_SH)
-                    except OSError:
-                        pass
-                raw_bytes = _read_all_bytes(fd)
+                self._flock(fd, _LOCK_SH)
+                st = os.fstat(fd)
+                file_key = (st.st_dev, st.st_ino)
+                if file_key != self._cache_file_key or st.st_size < self._cache_offset:
+                    self._reset_cache()
+                    self._cache_file_key = file_key
+                new_bytes = b""
+                if st.st_size > self._cache_offset:
+                    os.lseek(fd, self._cache_offset, os.SEEK_SET)
+                    new_bytes = _read_to_end(fd)
             finally:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
+                self._flock(fd, _LOCK_UN)
                 os.close(fd)
 
-            records_by_id: Dict[str, CallRecord] = {}
-            for raw_line in raw_bytes.decode("utf-8", errors="replace").splitlines():
-                stripped = raw_line.strip()
-                if not stripped:
-                    continue
+            # Only consume complete lines; keep a trailing partial line for the next read
+            # unless it is valid JSON on its own (e.g. a file written without a final newline).
+            last_nl = new_bytes.rfind(b"\n")
+            complete = new_bytes[: last_nl + 1] if last_nl >= 0 else b""
+            tail = new_bytes[last_nl + 1 :]
+            if tail.strip():
                 try:
-                    data = json.loads(stripped)
-                    rec = CallRecord.from_dict(data)
-                    records_by_id[rec.id] = rec
+                    json.loads(tail.decode("utf-8"))
+                    complete = new_bytes
                 except Exception:
-                    continue
-            return list(records_by_id.values())
+                    pass
+            self._cache_offset += len(complete)
+            self._parse_bytes(complete, into=self._cache_records)
+
+            records = list(self._cache_records.values())
+            return [_clone_record(r) for r in records] if copy_records else records
 
     def clear(self) -> None:
         """Remove all records from the JSONL log file."""
         with self._lock:
             if self.log_path.exists():
                 self.log_path.unlink()
+            self._reset_cache()
+
+
+def _read_to_end(fd: int) -> bytes:
+    chunks: List[bytes] = []
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_all_bytes_from_path(path: Path) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
 def _parse_iso_utc(ts: str) -> datetime:
@@ -480,6 +558,20 @@ def _parse_iso_utc(ts: str) -> datetime:
         return dt.astimezone(timezone.utc)
     except Exception:
         return datetime.now(timezone.utc)
+
+
+def filter_records_since(
+    records: Sequence[CallRecord],
+    days: Optional[float],
+    now: Optional[datetime] = None,
+) -> List[CallRecord]:
+    """Return only the records from the last `days` days (all records if `days` is None)."""
+    if days is None:
+        return list(records)
+    cutoff = (now or datetime.now(timezone.utc)).astimezone(timezone.utc) - timedelta(
+        days=float(days)
+    )
+    return [rec for rec in records if _parse_iso_utc(rec.timestamp) >= cutoff]
 
 
 def _percentile(sorted_vals: Sequence[float], pct: float) -> float:
@@ -543,11 +635,25 @@ def analyze_logs(
     total_cached = 0
     total_failed = 0
     total_retries = 0
+    estimated_calls = 0
+    estimated_cost_usd = 0.0
+    # metadata key -> metadata value -> {"cost": float, "calls": int}
+    metadata_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for rec in records:
         dt = _parse_iso_utc(rec.timestamp)
         cost = float(rec.cost_usd)
         spend_all_time += cost
+        if rec.estimated_tokens:
+            estimated_calls += 1
+            estimated_cost_usd += cost
+        for meta_key, meta_val in (rec.metadata or {}).items():
+            val_label = meta_val if isinstance(meta_val, str) else _safe_json_dumps(meta_val)
+            bucket = metadata_groups.setdefault(str(meta_key), {}).setdefault(
+                val_label, {"cost": 0.0, "calls": 0}
+            )
+            bucket["cost"] += cost
+            bucket["calls"] += 1
 
         if dt >= today_start:
             spend_today += cost
@@ -723,8 +829,19 @@ def analyze_logs(
         else "N/A"
     )
 
+    # "Which user / tenant / prompt version costs the most?" (top 25 values per metadata key)
+    metadata_costs: Dict[str, List[Dict[str, Any]]] = {}
+    for meta_key, values in metadata_groups.items():
+        rows = [
+            {"value": val, "total_cost_usd": round(b["cost"], 8), "total_calls": b["calls"]}
+            for val, b in values.items()
+        ]
+        rows.sort(key=lambda r: (r["total_cost_usd"], r["total_calls"]), reverse=True)
+        metadata_costs[meta_key] = rows[:25]
+
     return {
         "generated_at": reference_now.isoformat(),
+        "metadata_costs": metadata_costs,
         "spend_summary": {
             "today_usd": round(spend_today, 8),
             "this_week_usd": round(spend_this_week, 8),
@@ -743,6 +860,8 @@ def analyze_logs(
             "top_cost_feature": top_cost_feature,
             "most_failing_call": most_failing,
             "slowest_call": slowest_feature,
+            "estimated_calls": estimated_calls,
+            "estimated_cost_usd": round(estimated_cost_usd, 8),
         },
         "weekly_daily_spend": list(daily_buckets.values()),
         "feature_costs": feature_costs,

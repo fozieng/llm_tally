@@ -203,6 +203,10 @@ td.highlight {
   padding: 24px;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 .pill {
   display: inline-block;
   padding: 2px 8px;
@@ -229,7 +233,8 @@ td.highlight {
   border-color: rgba(168, 85, 247, 0.4);
 }
 
-.pill.warn {
+.pill.warn,
+.pill.incomplete {
   color: var(--accent-amber);
   border-color: rgba(245, 158, 11, 0.4);
 }

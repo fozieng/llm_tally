@@ -25,7 +25,14 @@ function renderSummaryAndKpis(report) {
     Number(overview.total_calls || 0) +
     " &bull; Cache Hit Rate: " +
     Number(overview.cache_hit_rate_pct || 0) +
-    "%";
+    "%" +
+    (Number(overview.estimated_calls || 0) > 0
+      ? " &bull; ~" +
+        Number(overview.estimated_calls) +
+        " calls (" +
+        formatUsd(overview.estimated_cost_usd) +
+        ") use estimated tokens"
+      : "");
 
   // 1. How much money did I spend this week?
   document.getElementById("q1Answer").textContent = formatUsd(spend.this_week_usd);
@@ -255,6 +262,7 @@ function renderSearchableCalls(recentCalls) {
       rec.model,
       rec.status,
       JSON.stringify(rec.config || {}),
+      JSON.stringify(rec.metadata || {}),
       rec.input_preview || "",
       rec.output_preview || "",
       rec.error_message || "",
@@ -271,13 +279,19 @@ function renderSearchableCalls(recentCalls) {
 
   tbody.innerHTML = filtered
     .map((rec) => {
+      const meta = rec.metadata && Object.keys(rec.metadata).length > 0
+        ? " <code>" + escapeHtml(JSON.stringify(rec.metadata)) + "</code>"
+        : "";
       const detail = rec.error_message
-        ? '<span class="err-cell">' + escapeHtml(rec.error_message) + "</span>"
+        ? '<span class="err-cell">' + escapeHtml(rec.error_message) + "</span>" + meta
         : "<code>" +
           escapeHtml(JSON.stringify(rec.config || {})) +
-          '</code> <span class="muted">' +
+          "</code>" +
+          meta +
+          ' <span class="muted">' +
           escapeHtml(rec.input_preview || "") +
           "</span>";
+      const costLabel = (rec.estimated_tokens ? "~" : "") + formatUsd(rec.cost_usd);
       return (
         "<tr>" +
         '<td class="muted">' +
@@ -297,7 +311,7 @@ function renderSearchableCalls(recentCalls) {
         escapeHtml(rec.status) +
         "</span></td>" +
         '<td class="num highlight">' +
-        formatUsd(rec.cost_usd) +
+        costLabel +
         "</td>" +
         '<td class="num">' +
         Number(rec.latency_ms || 0).toFixed(1) +
@@ -319,10 +333,36 @@ function renderSearchableCalls(recentCalls) {
     .join("");
 }
 
+function renderMetadataCosts(metadataCosts) {
+  const groups = metadataCosts || {};
+  const keys = Object.keys(groups);
+  if (keys.length === 0) return;
+  document.getElementById("metadataSection").hidden = false;
+  document.getElementById("metadataCostsBody").innerHTML = keys
+    .map((key) =>
+      (groups[key] || [])
+        .map(
+          (row) =>
+            "<tr><td><code>" +
+            escapeHtml(key) +
+            "</code></td><td><strong>" +
+            escapeHtml(row.value) +
+            '</strong></td><td class="num highlight">' +
+            formatUsd(row.total_cost_usd) +
+            '</td><td class="num">' +
+            Number(row.total_calls || 0) +
+            "</td></tr>"
+        )
+        .join("")
+    )
+    .join("");
+}
+
 function initDashboard(report) {
   renderSummaryAndKpis(report);
   renderWeeklyChart(report.weekly_daily_spend);
   renderFeatureCostsTable(report.feature_costs);
+  renderMetadataCosts(report.metadata_costs);
   renderFailuresTable(report.failure_stats);
   renderLatencyTable(report.latency_stats);
 

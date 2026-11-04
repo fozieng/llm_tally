@@ -71,11 +71,30 @@
   </div>
 </div>
 
+<!-- Cost by per-call metadata (shown only when calls carry metadata) -->
+<div class="section" id="metadataSection" hidden>
+  <h2>Cost by Metadata (&ldquo;Which user, tenant, or prompt version costs the most?&rdquo;)</h2>
+  <div class="sec-desc">Spend grouped by each metadata key attached with <code>metadata=</code> or <code>tally.context(...)</code> (top 25 values per key).</div>
+  <div style="overflow-x:auto;">
+    <table>
+      <thead>
+        <tr>
+          <th>Key</th>
+          <th>Value</th>
+          <th class="num">Total Cost</th>
+          <th class="num">Calls</th>
+        </tr>
+      </thead>
+      <tbody id="metadataCostsBody"></tbody>
+    </table>
+  </div>
+</div>
+
 <div class="two-col">
   <!-- Which calls fail the most? -->
   <div class="section">
     <h2>Failure &amp; Retry Analysis (&ldquo;Which calls fail the most?&rdquo;)</h2>
-    <div class="sec-desc">Tracks HTTP 5xx and network retry attempts ([0.5s, 1.0s, 1.5s]) and exhausted failures.</div>
+    <div class="sec-desc">Tracks HTTP 5xx, 429 rate-limit, and network retry attempts and exhausted failures.</div>
     <div style="overflow-x:auto;">
       <table>
         <thead>
@@ -118,7 +137,7 @@
 <!-- Searchable Call Explorer -->
 <div class="section">
   <h2>Search Call Logs</h2>
-  <div class="sec-desc">Search by feature name, model, config settings, input/output preview, or error message.</div>
+  <div class="sec-desc">Search by feature name, model, config settings, metadata, input/output preview, or error message. Costs marked <strong>~</strong> are estimated from text length because the response had no token usage.</div>
   <div class="search-bar">
     <input type="search" id="searchInput" placeholder="Search feature, model, config, input, output, or error..." />
     <select id="statusFilter">
@@ -126,6 +145,7 @@
       <option value="success">Success (Live Call)</option>
       <option value="cached">Cached Hit</option>
       <option value="failed">Failed</option>
+      <option value="incomplete">Incomplete Stream</option>
     </select>
   </div>
   <div style="overflow-x:auto;">

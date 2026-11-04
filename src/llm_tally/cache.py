@@ -168,11 +168,16 @@ def is_stream_or_generator(value: Any) -> bool:
 
 def is_llm_stream(value: Any) -> bool:
     """
-    Return True if `value` is a generator or an SDK stream iterator (not a file handle
-    or built-in collection iterator like `map`, `zip`, `filter`, `enumerate`).
+    Return True if `value` is a generator, an SDK stream iterator, or an SDK stream context
+    manager such as Anthropic's `MessageStreamManager` / OpenAI's `ChatCompletionStreamManager`
+    (not a file handle or built-in collection iterator like `map`, `zip`, `filter`, `enumerate`).
     """
     if isinstance(value, io.IOBase):
         return False
+    if type(value).__name__.endswith("StreamManager") and (
+        hasattr(value, "__enter__") or hasattr(value, "__aenter__")
+    ):
+        return True
     if isinstance(value, (map, filter, zip, enumerate)):
         return False
     if type(value).__name__ in (

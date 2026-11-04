@@ -859,10 +859,15 @@ class TestAll15BugRegressions(unittest.TestCase):
             logger = JSONLLogger(log_file)
             records = logger.read_all()
             self.assertEqual(len(records), 480)
-            # Also verify raw line count in the file is 480 and all stream updates finalized
+            self.assertTrue(all(r.output_tokens > 0 for r in records))
+            # The log is append-only: each stream writes a placeholder line and a final line
+            raw_lines = [ln for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertEqual(len(raw_lines), 960)
+            # `compact()` rewrites it to one line per record without losing anything
+            self.assertEqual(logger.compact(), 480)
             raw_lines = [ln for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
             self.assertEqual(len(raw_lines), 480)
-            self.assertTrue(all(r.output_tokens > 0 for r in records))
+            self.assertEqual(len(JSONLLogger(log_file).read_all()), 480)
 
 
 def _mp_stream_worker(log_path: str, worker_id: int, count: int) -> None:
