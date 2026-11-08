@@ -29,6 +29,8 @@ import json
 import re
 import threading
 import time
+import uuid
+import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional, Set, Tuple, TypeVar
@@ -37,6 +39,12 @@ T = TypeVar("T")
 
 # Matches default Python memory address suffixes like " at 0x104a8b2c0"
 _MEM_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+")
+
+# Factory-created closures share a qualified name but can produce different answers.
+# Keep a stable token per live closure without retaining the function or hashing its
+# mutable captured state (such as a call counter) on every lookup.
+_CLOSURE_TOKENS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_CLOSURE_TOKEN_LOCK = threading.Lock()
 
 
 @dataclass
@@ -334,6 +342,14 @@ def build_cache_key(
         "kwargs": _normalize_for_key(kwargs),
         "settings": _normalize_for_key(settings or {}),
     }
+    target = getattr(func, "__func__", func)
+    if inspect.isfunction(target) and target.__closure__:
+        with _CLOSURE_TOKEN_LOCK:
+            token = _CLOSURE_TOKENS.get(target)
+            if token is None:
+                token = uuid.uuid4().hex
+                _CLOSURE_TOKENS[target] = token
+        snapshot["closure_identity"] = token
     serialized = _canonical_json(snapshot)
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return digest, snapshot

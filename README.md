@@ -15,6 +15,7 @@ Works in any Python 3.9+ application with zero external runtime dependencies. Fu
 - **Kill After `X` Requests (`max_requests`)**: An entry removes itself after being fetched `X` times.
 - **Off by default in `@tally.track`.** LLM output with `temperature > 0` is supposed to vary, so caching only happens where you ask for it (`cache=True`, `@tally.cache`, or `default_cache_enabled=True`).
 - **Pluggable**: pass `cache_backend=` to share a cache across workers (e.g. a Redis-backed object with the same `fetch`/`store`/`clear` methods as `InMemoryCache`).
+- Factory-created closures have separate cache identities. These identities last for the function's lifetime in its process, so closure entries are not shared across workers or restarts.
 
 ### 2. Smart Retries on HTTP 5xx, 429 Rate Limits & Network Issues
 - Retries **HTTP 500/5xx** errors (raised exceptions or returned response objects), **HTTP 429 / `RateLimitError`**, and **network/timeout** errors (`ConnectionError`, `TimeoutError`, `URLError`, SDK connection/timeout exceptions).

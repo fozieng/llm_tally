@@ -147,6 +147,16 @@ class HTTPStatus5xxError(RuntimeError):
         super().__init__(msg)
 
 
+class HTTPRateLimitError(RuntimeError):
+    """Raised internally for a returned HTTP 429 response."""
+
+    status_code = 429
+
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        super().__init__("HTTP 429 Rate Limit returned by response")
+
+
 class RetryExhaustedError(Exception):
     """
     Raised when the initial call and all retry attempts fail.
@@ -230,7 +240,8 @@ def extract_retry_after(exc: BaseException) -> Optional[float]:
     if isinstance(attr, (int, float)) and not isinstance(attr, bool) and attr >= 0:
         return float(attr)
 
-    headers = getattr(getattr(exc, "response", None), "headers", None)
+    response = getattr(exc, "response", None)
+    headers = response.get("headers") if isinstance(response, dict) else getattr(response, "headers", None)
     if headers is None:
         headers = getattr(exc, "headers", None)
 
@@ -348,9 +359,11 @@ def is_retryable_exception(
     return False, status_code
 
 
-def _check_response_for_5xx(result: Any) -> None:
-    """If the returned object itself carries a 5xx status_code, raise HTTPStatus5xxError to trigger retry."""
+def _check_response_for_retryable_status(result: Any, retry_on_rate_limit: bool = True) -> None:
+    """Turn retryable returned HTTP statuses into exceptions for the retry engine."""
     status = extract_status_code(result)
+    if status == 429 and retry_on_rate_limit:
+        raise HTTPRateLimitError(response=result)
     if status is not None and 500 <= status <= 599:
         raise HTTPStatus5xxError(status_code=status, response=result)
 
@@ -394,7 +407,7 @@ def execute_with_retry_sync(
         start = time.perf_counter()
         try:
             result = func(*args, **kwargs)
-            _check_response_for_5xx(result)
+            _check_response_for_retryable_status(result, cfg.retry_on_rate_limit)
             return result, failures
         except BaseException as exc:
             if isinstance(exc, _NON_RETRYABLE_BASE_EXCEPTIONS):
@@ -464,7 +477,7 @@ async def execute_with_retry_async(
         start = time.perf_counter()
         try:
             result = await func(*args, **kwargs)
-            _check_response_for_5xx(result)
+            _check_response_for_retryable_status(result, cfg.retry_on_rate_limit)
             return result, failures
         except BaseException as exc:
             if isinstance(exc, _NON_RETRYABLE_BASE_EXCEPTIONS):
