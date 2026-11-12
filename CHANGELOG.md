@@ -11,6 +11,8 @@
 - `log_previews=False` now also hides error message text (exception types and status codes are kept), and `redact` now also applies to error messages, retry-attempt messages, and `config` strings.
 
 ### Fixed
+- Functions created by a factory (closures with the same qualified name) no longer share cache entries. Each live closure gets its own cache identity.
+- A *returned* response object with HTTP 429 is now retried like a raised rate-limit error (unless `retry_on_rate_limit=False`), and `Retry-After` is read from dict-style responses too.
 - Passing `None` to `LLMTally(...)` arguments now means "use the default". Before, it silently disabled caching, retries, or the dashboard, logged the model as `"None"`, or raised `TypeError`.
 - A `model=` keyword passed to the wrapped function is now used to price the call when the response doesn't report the model. Before, it was priced as `default_model`.
 - A stream abandoned before it finished was left logged as `success` with 0 output tokens. It is now logged as `incomplete`, with the tokens seen so far.
