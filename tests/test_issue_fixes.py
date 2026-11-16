@@ -567,6 +567,13 @@ class ProductionTests(Base):
 
         ask("x")
         self.assertTrue(started.wait(5))
+        # Let the background build finish before tearDown deletes its directory
+        timer = tally._dashboard_timer
+        if timer is not None:
+            timer.join(5)
+        for t in threading.enumerate():
+            if isinstance(t, threading.Timer) and t is not threading.current_thread():
+                t.join(5)
 
     def test_async_calls_still_work(self) -> None:
         tally = self.make()
