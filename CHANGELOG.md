@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Breaking changes
 - **No default model.** `default_model` now defaults to `None`. A call whose model can't be detected is logged as `"unknown"` with cost `$0` and `unpriced=True`, instead of being labelled and priced as `gpt-4o-mini`. Pass `default_model="..."` to keep the old behaviour.

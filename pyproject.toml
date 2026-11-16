@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-tally"
-version = "0.2.0"
+version = "0.3.0"
 description = "Zero-dependency Python LLM toolkit with self-evicting in-memory caching, smart 5xx/429/network retries, per-feature cost tracking, and an interactive HTML dashboard."
 readme = "README.md"
 license = "MIT"
