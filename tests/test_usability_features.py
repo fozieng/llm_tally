@@ -59,7 +59,7 @@ class TestUsabilityFeatures(unittest.TestCase):
             retry_delays=None,
             auto_update_dashboard=None,
         )
-        self.assertEqual(tally.default_model, "gpt-4o-mini")
+        self.assertIsNone(tally.default_model)  # no model is assumed
         self.assertEqual(tally.log_path, Path(".llm_tally/logs.jsonl"))
         self.assertEqual(tally.dashboard_path, Path(".llm_tally/dashboard.html"))
         self.assertFalse(tally.default_cache_enabled)
@@ -195,7 +195,7 @@ class TestUsabilityFeatures(unittest.TestCase):
         records = tally.get_records()
         self.assertEqual(len(records), 3)
         for rec in records:
-            self.assertIn(f'"{rec.metadata["user_id"]}"', rec.input_preview)
+            self.assertEqual(rec.metadata["user_id"], rec.input_preview)
 
     def test_on_record_sink_gets_one_final_record_per_call_even_without_file(self) -> None:
         received = []

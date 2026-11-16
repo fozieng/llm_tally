@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import List, Optional
 
 from .core import DEFAULT_DASHBOARD_PATH, DEFAULT_DASHBOARD_TITLE, DEFAULT_LOG_PATH
 from .dashboard import write_dashboard_file
-from .tracker import JSONLLogger, analyze_logs, filter_records_since
+from .pricing import PricingRegistry
+from .tracker import JSONLLogger, analyze_logs, filter_records_since, reprice_records
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,6 +30,14 @@ def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--log", default=DEFAULT_LOG_PATH, help=f"JSONL log file (default: {DEFAULT_LOG_PATH})")
     common.add_argument("--days", type=float, default=None, help="Only include the last N days")
+    common.add_argument(
+        "--pricing-file",
+        default=None,
+        help="JSON price list; calls logged as unpriced are re-priced with it",
+    )
+    common.add_argument(
+        "--backups", type=int, default=3, help="Rotated backups (<log>.1 ... .N) to include (default: 3)"
+    )
 
     dash = sub.add_parser("dashboard", parents=[common], help="Write the static HTML dashboard")
     dash.add_argument("--out", default=DEFAULT_DASHBOARD_PATH, help=f"Output HTML file (default: {DEFAULT_DASHBOARD_PATH})")
@@ -48,7 +58,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Compacted {args.log}: {kept} calls")
         return 0
 
-    records = filter_records_since(JSONLLogger(args.log).read_all(copy_records=False), args.days)
+    if not os.path.exists(args.log):
+        print(
+            f"llm-tally: no log file at {args.log} (pass --log, or set LLM_TALLY_DIR)",
+            file=sys.stderr,
+        )
+    log = JSONLLogger(args.log, backups=args.backups)
+    records = filter_records_since(log.read_all(copy_records=False, include_backups=True), args.days)
+    pricing = PricingRegistry()
+    if args.pricing_file:
+        pricing.load_file(args.pricing_file)
+    records = reprice_records(records, pricing)
 
     if args.command == "dashboard":
         path = write_dashboard_file(records, dashboard_path=args.out, title=args.title)
@@ -70,6 +90,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Saved by cache:   ${spend['saved_by_cache_usd']:.4f}")
     if overview["estimated_calls"]:
         print(f"Estimated tokens: {overview['estimated_calls']} calls (${overview['estimated_cost_usd']:.4f})")
+    if overview["unpriced_calls"]:
+        models = ", ".join(f"{m} ({n})" for m, n in overview["unpriced_models"].items())
+        print(f"Unpriced calls:   {overview['unpriced_calls']} — no price for: {models}")
     print(f"Top cost feature: {overview['top_cost_feature']}")
     print(f"Most failing:     {overview['most_failing_call']}")
     print(f"Slowest:          {overview['slowest_call']}")

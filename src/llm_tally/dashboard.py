@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
+from .pricing import PRICING_AS_OF
 from .tracker import CallRecord, analyze_logs
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -48,13 +49,18 @@ def _safe_script_json(data: Any) -> str:
 def render_dashboard_html(
     records: Sequence[CallRecord],
     title: str = "llm-tally — Cost & Reliability Dashboard",
+    recent_limit: int = 500,
 ) -> str:
     """
     Assemble a complete, self-contained HTML dashboard string by combining the
     `dashboard.html`, `dashboard.css`, and `dashboard.js` template files with
     the JSON analytics report from `analyze_logs(records)` in a single pass.
+
+    `records` can come from anywhere (e.g. a database fed by an `on_record` sink), not only
+    from the local JSONL file.
     """
-    report: Dict[str, Any] = analyze_logs(records)
+    report: Dict[str, Any] = analyze_logs(records, recent_limit=recent_limit)
+    report["pricing_as_of"] = PRICING_AS_OF
     report_json = _safe_script_json(report)
 
     html_template = _load_template_asset("dashboard.html")
@@ -74,11 +80,12 @@ def write_dashboard_file(
     records: Sequence[CallRecord],
     dashboard_path: str | Path = ".llm_tally/dashboard.html",
     title: str = "llm-tally — Cost & Reliability Dashboard",
+    recent_limit: int = 500,
 ) -> Path:
     """Generate and atomically write the static HTML dashboard file to disk."""
     target = Path(dashboard_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    html_content = render_dashboard_html(records, title=title)
+    html_content = render_dashboard_html(records, title=title, recent_limit=recent_limit)
 
     fd, tmp_name = tempfile.mkstemp(
         prefix=".dashboard_",
@@ -88,6 +95,11 @@ def write_dashboard_file(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(html_content)
+        # mkstemp creates 0600 files; make the dashboard readable like the JSONL log (0644)
+        try:
+            os.chmod(tmp_name, 0o644)
+        except OSError:
+            pass
         os.replace(tmp_name, target)
     except Exception:
         try:

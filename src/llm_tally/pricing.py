@@ -32,15 +32,16 @@ _VERSION_SUFFIX_RE = re.compile(
     r"|exp(?:-[\w.:]+)*"
     r"|free"
     r"|chat(?:-latest|-preview|-\d{4}-\d{2}-\d{2})?"
-    r"|audio(?:-preview|-\d{4}-\d{2}-\d{2})?"
-    r"|realtime(?:-preview|-\d{4}-\d{2}-\d{2})?"
-    r"|search(?:-preview|-\d{4}-\d{2}-\d{2})?"
-    r"|transcribe(?:-\d{4}-\d{2}-\d{2})?"
-    r"|tts(?:-\d{4}-\d{2}-\d{2})?"
     r"))+$"
 )
+# Note: `-audio`, `-realtime`, `-search`, `-transcribe`, and `-tts` are NOT treated as version
+# suffixes. Those are different products with their own (often per-minute) prices, so an
+# unlisted one is reported as unpriced instead of being billed at the text model's rate.
 
-_BEDROCK_PREFIX_RE = re.compile(r"^(?:[a-z]{2}(?:-[a-z]+-\d+)?\.)?(?:anthropic|amazon|meta|mistral)\.")
+# Bedrock IDs may carry a cross-region inference prefix: `us.`, `eu.`, `apac.`, `global.`, `us-gov.`
+_BEDROCK_PREFIX_RE = re.compile(
+    r"^(?:[a-z]+(?:-[a-z]+)*\.)?(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek)\."
+)
 _BEDROCK_VERSION_RE = re.compile(r"-v\d+(?::\d+)?$")
 _VERTEX_AT_RE = re.compile(r"(?:-v\d+)?@(\d{8}|\d{3,4}|default)$")
 
@@ -114,6 +115,13 @@ class ModelPricing:
         return round(input_cost + cached_cost + creation_cost + output_cost, 8)
 
 
+# When the built-in prices were last reviewed. Provider prices change; anything newer
+# should be added with `register_model(...)` or a `pricing_file=` JSON file.
+PRICING_AS_OF = "2025-11"
+
+# Model name recorded when no model could be determined for a call
+UNKNOWN_MODEL = "unknown"
+
 # Comprehensive default pricing catalog (USD per 1M tokens)
 DEFAULT_PRICING: Dict[str, ModelPricing] = {
     # ---------------- OpenAI Models ----------------
@@ -129,6 +137,8 @@ DEFAULT_PRICING: Dict[str, ModelPricing] = {
     "gpt-4.1-mini": ModelPricing("gpt-4.1-mini", "openai", 0.40, 1.60, 0.10),
     "gpt-4.1-nano": ModelPricing("gpt-4.1-nano", "openai", 0.10, 0.40, 0.025),
     "gpt-4o": ModelPricing("gpt-4o", "openai", 2.50, 10.00, 1.25),
+    # The first gpt-4o snapshot kept the launch price
+    "gpt-4o-2024-05-13": ModelPricing("gpt-4o-2024-05-13", "openai", 5.00, 15.00),
     "chatgpt-4o": ModelPricing("chatgpt-4o", "openai", 5.00, 15.00),
     "gpt-4o-audio": ModelPricing("gpt-4o-audio", "openai", 2.50, 10.00),
     "gpt-4o-realtime": ModelPricing("gpt-4o-realtime", "openai", 5.00, 20.00, 2.50),
@@ -147,6 +157,12 @@ DEFAULT_PRICING: Dict[str, ModelPricing] = {
     "o3-mini": ModelPricing("o3-mini", "openai", 1.10, 4.40, 0.55),
     "o4-mini": ModelPricing("o4-mini", "openai", 1.10, 4.40, 0.275),
     "gpt-4-turbo": ModelPricing("gpt-4-turbo", "openai", 10.00, 30.00),
+    # GPT-4 Turbo preview snapshots (would otherwise match plain "gpt-4" at $30/$60)
+    "gpt-4-turbo-preview": ModelPricing("gpt-4-turbo-preview", "openai", 10.00, 30.00),
+    "gpt-4-1106-preview": ModelPricing("gpt-4-1106-preview", "openai", 10.00, 30.00),
+    "gpt-4-0125-preview": ModelPricing("gpt-4-0125-preview", "openai", 10.00, 30.00),
+    "gpt-4-1106-vision-preview": ModelPricing("gpt-4-1106-vision-preview", "openai", 10.00, 30.00),
+    "gpt-4-vision-preview": ModelPricing("gpt-4-vision-preview", "openai", 10.00, 30.00),
     "gpt-4-32k": ModelPricing("gpt-4-32k", "openai", 60.00, 120.00),
     "gpt-4": ModelPricing("gpt-4", "openai", 30.00, 60.00),
     "gpt-3.5-turbo": ModelPricing("gpt-3.5-turbo", "openai", 0.50, 1.50),
@@ -272,6 +288,14 @@ class PricingRegistry:
         return None
 
     def _lookup_candidate(self, candidate: str) -> Optional[ModelPricing]:
+        # OpenRouter-style free variants (`...:free`) cost nothing
+        if candidate.endswith(":free"):
+            base = self._lookup_candidate(candidate[: -len(":free")])
+            provider = base.provider if base is not None else "custom"
+            return ModelPricing(model=candidate, provider=provider, input_cost_per_1m=0.0,
+                                output_cost_per_1m=0.0, cached_input_cost_per_1m=0.0,
+                                cache_creation_cost_per_1m=0.0)
+
         found = self._lookup_single(candidate)
         if found is not None:
             return found
@@ -281,14 +305,18 @@ class PricingRegistry:
             return self._lookup_single(platform_norm)
         return None
 
-    def resolve(self, model: str, warn_on_unknown: bool = True) -> ModelPricing:
+    def lookup(self, model: Optional[str]) -> Optional[ModelPricing]:
         """
-        Resolve pricing for `model`:
-        1. Full model string match, platform ID normalization, or versioned snapshot match.
-        2. Short name after `/` if prefixed with a provider/namespace (e.g. `models/gemini-2.5-flash`).
-        3. Fallback default (`$0.50 / $1.50` per 1M) with a `UserWarning` so unknown models are visible.
+        Return the pricing for `model`, or None if it is not in the catalog. Never warns and never
+        falls back to a guessed rate. Matches, in order:
+        1. The full model string, platform IDs (Bedrock / Vertex / fine-tuned), and dated snapshots.
+        2. The short name after the last `/` (e.g. `models/gemini-2.5-flash`, `anthropic/claude-...`).
         """
-        norm = (model or "gpt-4o-mini").strip().lower()
+        if not model or not str(model).strip():
+            return None
+        norm = str(model).strip().lower()
+        if norm == UNKNOWN_MODEL:
+            return None
 
         # 1. Check full name first (so custom models like "meta-llama/llama-3-70b" match directly!)
         found = self._lookup_candidate(norm)
@@ -298,9 +326,24 @@ class PricingRegistry:
         # 2. If `norm` contains `/`, try the segment after the last `/`
         if "/" in norm:
             _, _, short_name = norm.rpartition("/")
-            found_short = self._lookup_candidate(short_name)
-            if found_short is not None:
-                return found_short
+            return self._lookup_candidate(short_name)
+        return None
+
+    def is_known(self, model: Optional[str]) -> bool:
+        """Return True if `model` has a price in the catalog."""
+        return self.lookup(model) is not None
+
+    def resolve(self, model: str, warn_on_unknown: bool = True) -> ModelPricing:
+        """
+        Resolve pricing for `model` like `lookup()`, but fall back to a placeholder rate
+        (`$0.50 / $1.50` per 1M) with a `UserWarning` when the model is unknown.
+
+        `LLMTally` does not use this fallback: it records unknown models as unpriced instead.
+        """
+        found = self.lookup(model)
+        if found is not None:
+            return found
+        norm = (model or UNKNOWN_MODEL).strip().lower()
 
         if warn_on_unknown:
             warnings.warn(

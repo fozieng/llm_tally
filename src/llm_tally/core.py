@@ -19,8 +19,11 @@ import contextlib
 import contextvars
 import functools
 import inspect
+import json
+import logging
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -44,7 +47,7 @@ from typing import (
 
 from .cache import InMemoryCache, build_cache_key, is_llm_stream
 from .dashboard import render_dashboard_html, write_dashboard_file
-from .pricing import ModelPricing, PricingRegistry
+from .pricing import UNKNOWN_MODEL, ModelPricing, PricingRegistry
 from .retry import (
     DEFAULT_RETRY_DELAYS,
     AttemptFailure,
@@ -61,15 +64,27 @@ from .tracker import (
     extract_token_usage,
     filter_records_since,
     format_preview,
+    reprice_records,
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
 RecordSink = Callable[[CallRecord], Any]
 
-DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_LOG_PATH = ".llm_tally/logs.jsonl"
-DEFAULT_DASHBOARD_PATH = ".llm_tally/dashboard.html"
+# No model is assumed by default: a call whose model can't be determined is logged as
+# "unknown" and flagged `unpriced` instead of being priced as some arbitrary model.
+DEFAULT_MODEL: Optional[str] = None
+# `LLM_TALLY_DIR` moves the default log and dashboard location (e.g. to an absolute path, so
+# every process writes to the same place no matter which directory it was started from).
+DEFAULT_DIR = os.environ.get("LLM_TALLY_DIR") or ".llm_tally"
+DEFAULT_LOG_PATH = os.path.join(DEFAULT_DIR, "logs.jsonl")
+DEFAULT_DASHBOARD_PATH = os.path.join(DEFAULT_DIR, "dashboard.html")
 DEFAULT_DASHBOARD_TITLE = "llm-tally — Cost & Reliability Dashboard"
+
+logger = logging.getLogger("llm_tally")
+
+# Inline dashboard rebuilds above this log size (or slower than this) move to a background thread
+_INLINE_DASHBOARD_MAX_LOG_BYTES = 2 * 1024 * 1024
+_INLINE_DASHBOARD_MAX_SECONDS = 0.05
 
 # Metadata set via `tally.context(...)`; contextvars keep it per-thread and per-asyncio-task
 _CONTEXT_METADATA: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
@@ -89,12 +104,202 @@ def _flush_all_dashboards() -> None:
             pass
 
 
-def _call_time_model(kwargs: Dict[str, Any]) -> Optional[str]:
-    """Return the `model=` keyword the wrapped function was called with, if it is a string."""
+def _reset_tallies_after_fork() -> None:
+    for tally in list(_LIVE_TALLIES):
+        try:
+            tally._reset_after_fork()
+        except Exception:
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_tallies_after_fork)
+
+
+_SIGNATURES: "weakref.WeakKeyDictionary[Any, Optional[inspect.Signature]]" = weakref.WeakKeyDictionary()
+_SIGNATURE_LOCK = threading.Lock()
+
+# Argument names whose values are never written to previews (matched case-insensitively)
+_SECRET_ARG_RE = re.compile(
+    r"^(?:.*api[_-]?key.*|.*secret.*|.*passw(?:or)?d.*|.*credential.*|authorization|"
+    r"(?:access|auth|bearer|refresh|id|session)[_-]?token|token|cookie|x-api-key)$",
+    re.IGNORECASE,
+)
+_REDACTED = "[redacted]"
+
+
+def _signature_of(func: Callable[..., Any]) -> Optional[inspect.Signature]:
+    """`inspect.signature` of the underlying function, cached per function object."""
+    target = getattr(func, "__func__", func)
+    try:
+        with _SIGNATURE_LOCK:
+            if target in _SIGNATURES:
+                return _SIGNATURES[target]
+    except TypeError:  # not weak-referenceable / not hashable
+        pass
+    try:
+        sig: Optional[inspect.Signature] = inspect.signature(target)
+    except (TypeError, ValueError):
+        sig = None
+    try:
+        with _SIGNATURE_LOCK:
+            _SIGNATURES[target] = sig
+    except TypeError:
+        pass
+    return sig
+
+
+def _bound_arguments(
+    func: Callable[..., Any],
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    apply_defaults: bool = True,
+) -> Optional[Tuple[inspect.Signature, Dict[str, Any]]]:
+    """Bind a call to `func`'s signature, or None if that isn't possible."""
+    sig = _signature_of(func)
+    if sig is None:
+        return None
+    call_args = tuple(args)
+    if inspect.ismethod(func):
+        call_args = (func.__self__,) + call_args
+    try:
+        bound = sig.bind(*call_args, **kwargs)
+    except TypeError:
+        return None
+    if apply_defaults:
+        bound.apply_defaults()
+    return sig, dict(bound.arguments)
+
+
+def _declared_params(func: Callable[..., Any]) -> frozenset:
+    """Names of the parameters `func` explicitly declares (not `*args` / `**kwargs`)."""
+    sig = _signature_of(func)
+    if sig is None:
+        return frozenset()
+    return frozenset(
+        name
+        for name, param in sig.parameters.items()
+        if param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    )
+
+
+def _call_time_model(
+    func: Optional[Callable[..., Any]],
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Return the model the wrapped function was called with: a `model` argument passed by
+    keyword or position, or the function's own `model=` default.
+    """
     val = kwargs.get("model")
     if isinstance(val, str) and val.strip():
         return val.strip()
+    if func is not None:
+        bound = _bound_arguments(func, args, kwargs)
+        if bound is not None:
+            val = bound[1].get("model")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     return None
+
+
+def _mask_secrets(value: Any, _depth: int = 0) -> Any:
+    """Replace values stored under secret-looking keys (api_key, password, ...) in dicts."""
+    if _depth > 4:
+        return value
+    if isinstance(value, dict):
+        return {
+            k: (_REDACTED if isinstance(k, str) and _SECRET_ARG_RE.match(k) else _mask_secrets(v, _depth + 1))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_mask_secrets(v, _depth + 1) for v in value]
+    return value
+
+
+def _call_inputs(
+    func: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    The arguments the caller actually passed, by parameter name, for previews and token
+    estimates: drops `self` / `cls`, flattens `*args` / `**kwargs`, and masks secret-looking
+    arguments.
+    """
+    bound = _bound_arguments(func, args, kwargs, apply_defaults=False)
+    if bound is None:
+        inputs: Dict[str, Any] = {}
+        if args:
+            inputs["args"] = list(args)
+        inputs.update(kwargs)
+        return _mask_secrets(inputs)
+    sig, arguments = bound
+    params = list(sig.parameters.values())
+    inputs = {}
+    for idx, param in enumerate(params):
+        if param.name not in arguments:
+            continue
+        val = arguments[param.name]
+        if idx == 0 and param.name in ("self", "cls"):
+            continue
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            if val:
+                inputs[param.name] = list(val)
+        elif param.kind is inspect.Parameter.VAR_KEYWORD:
+            inputs.update(val)
+        else:
+            inputs[param.name] = val
+    return _mask_secrets(inputs)
+
+
+def _input_preview_value(inputs: Dict[str, Any]) -> Any:
+    """Show a lone text argument as itself instead of as a JSON object."""
+    text_values = [v for v in inputs.values() if isinstance(v, str)]
+    if len(inputs) == 1 and len(text_values) == 1:
+        return text_values[0]
+    return inputs
+
+
+def _response_text(value: Any) -> Any:
+    """Best-effort answer text from common SDK response shapes (falls back to `value`)."""
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    try:
+        if isinstance(value, dict):
+            for key in ("content", "text", "output_text"):
+                if isinstance(value.get(key), str):
+                    return value[key]
+            return value
+        # OpenAI Responses API
+        out_text = getattr(value, "output_text", None)
+        if isinstance(out_text, str) and out_text:
+            return out_text
+        # OpenAI Chat Completions
+        choices = getattr(value, "choices", None)
+        if isinstance(choices, (list, tuple)) and choices:
+            message = getattr(choices[0], "message", None)
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                return content
+            text = getattr(choices[0], "text", None)
+            if isinstance(text, str):
+                return text
+        # Anthropic Messages / LangChain messages
+        content = getattr(value, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, (list, tuple)):
+            parts = [getattr(block, "text", None) for block in content]
+            texts = [t for t in parts if isinstance(t, str)]
+            if texts:
+                return "".join(texts)
+        # Gemini (`.text` is a property that can raise when there is no text part)
+        text = getattr(value, "text", None)
+        if isinstance(text, str):
+            return text
+    except Exception:
+        pass
+    return value
 
 
 def _extract_chunk_text(chunk: Any) -> str:
@@ -127,6 +332,9 @@ def _extract_chunk_text(chunk: Any) -> str:
     if isinstance(txt, str):
         return txt
     delta = getattr(chunk, "delta", None)
+    # OpenAI Responses API `response.output_text.delta` events carry the text in `delta`
+    if isinstance(delta, str) and str(getattr(chunk, "type", "")).endswith("output_text.delta"):
+        return delta
     delta_txt = getattr(delta, "text", None)
     if isinstance(delta_txt, str):
         return delta_txt
@@ -190,11 +398,7 @@ class _StreamUsageAccumulator:
             if u.input_excludes_cached is not None:
                 self.input_excludes_cached = u.input_excludes_cached
 
-    def build_final_usage(
-        self,
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
-    ) -> Tuple[TokenUsage, str]:
+    def build_final_usage(self, inputs: Dict[str, Any]) -> Tuple[TokenUsage, str]:
         joined_text = "".join(self.collected_text)
         if self.has_structured_usage:
             return (
@@ -209,7 +413,7 @@ class _StreamUsageAccumulator:
                 ),
                 joined_text,
             )
-        fallback = extract_token_usage(joined_text, args=args, kwargs=kwargs)
+        fallback = extract_token_usage(joined_text, inputs=inputs)
         if self.detected_model and not fallback.detected_model:
             fallback.detected_model = self.detected_model
         return fallback, joined_text
@@ -238,8 +442,7 @@ class _SyncStreamProxy:
         failed_attempts: List[AttemptFailure],
         explicit_input_tokens: Optional[int],
         explicit_output_tokens: Optional[int],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        inputs: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._stream = stream
@@ -259,8 +462,7 @@ class _SyncStreamProxy:
         self._failed_attempts = failed_attempts
         self._explicit_input_tokens = explicit_input_tokens
         self._explicit_output_tokens = explicit_output_tokens
-        self._args = args
-        self._kwargs = kwargs
+        self._inputs = inputs
         self._acc = _StreamUsageAccumulator()
         self._finalized = False
 
@@ -289,7 +491,7 @@ class _SyncStreamProxy:
             if callable(close_fn):
                 return close_fn()
         finally:
-            self._finalize(status="success", error_message=None)
+            self._finalize_on_close()
 
     def __enter__(self) -> "_SyncStreamProxy":
         enter_fn = getattr(self._stream, "__enter__", None)
@@ -338,13 +540,29 @@ class _SyncStreamProxy:
         except Exception:
             pass
 
+    def _finalize_on_close(self) -> None:
+        """
+        `close()` before the stream was exhausted means the caller stopped early: log it as
+        `incomplete`, unless the SDK's final snapshot shows the full response arrived.
+        """
+        if self._finalized:
+            return
+        self._acc.observe_snapshot(self._stream)
+        if self._acc.has_structured_usage:
+            self._finalize(status="success", error_message=None)
+        else:
+            self._finalize(
+                status="incomplete",
+                error_message="Stream was closed before it was fully consumed",
+            )
+
     def _finalize(self, status: str, error_message: Optional[str]) -> None:
         if self._finalized:
             return
         self._finalized = True
         latency_ms = (time.perf_counter() - self._start_perf) * 1000.0
         self._acc.observe_snapshot(self._stream)
-        usage, joined_text = self._acc.build_final_usage(self._args, self._kwargs)
+        usage, joined_text = self._acc.build_final_usage(self._inputs)
         estimated = usage.estimated and not (
             self._explicit_input_tokens is not None and self._explicit_output_tokens is not None
         )
@@ -364,7 +582,7 @@ class _SyncStreamProxy:
             or usage.detected_model
             or self._chosen_model
         )
-        cost_usd = self._tally._safe_calculate_cost(
+        cost_usd, priced = self._tally._safe_calculate_cost(
             model=final_model,
             input_tokens=in_tok,
             output_tokens=out_tok,
@@ -390,11 +608,11 @@ class _SyncStreamProxy:
             retries=len(self._failed_attempts),
             error_message=error_message,
             attempt_errors=[a.to_dict() for a in self._failed_attempts],
-            args=self._args,
-            kwargs=self._kwargs,
+            inputs=self._inputs,
             response=joined_text or "<stream>",
             estimated_tokens=estimated,
             metadata=self._metadata,
+            unpriced=not priced,
         )
 
 
@@ -419,8 +637,7 @@ class _AsyncStreamProxy:
         failed_attempts: List[AttemptFailure],
         explicit_input_tokens: Optional[int],
         explicit_output_tokens: Optional[int],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        inputs: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._stream = stream
@@ -440,8 +657,7 @@ class _AsyncStreamProxy:
         self._failed_attempts = failed_attempts
         self._explicit_input_tokens = explicit_input_tokens
         self._explicit_output_tokens = explicit_output_tokens
-        self._args = args
-        self._kwargs = kwargs
+        self._inputs = inputs
         self._acc = _StreamUsageAccumulator()
         self._finalized = False
 
@@ -476,7 +692,7 @@ class _AsyncStreamProxy:
                     return await res
                 return res
         finally:
-            self._finalize(status="success", error_message=None)
+            self._finalize_on_close()
 
     def close(self) -> Any:
         try:
@@ -484,7 +700,7 @@ class _AsyncStreamProxy:
             if callable(close_fn):
                 return close_fn()
         finally:
-            self._finalize(status="success", error_message=None)
+            self._finalize_on_close()
 
     async def __aenter__(self) -> "_AsyncStreamProxy":
         aenter_fn = getattr(self._stream, "__aenter__", None)
@@ -529,13 +745,29 @@ class _AsyncStreamProxy:
         except Exception:
             pass
 
+    def _finalize_on_close(self) -> None:
+        """
+        `close()` before the stream was exhausted means the caller stopped early: log it as
+        `incomplete`, unless the SDK's final snapshot shows the full response arrived.
+        """
+        if self._finalized:
+            return
+        self._acc.observe_snapshot(self._stream)
+        if self._acc.has_structured_usage:
+            self._finalize(status="success", error_message=None)
+        else:
+            self._finalize(
+                status="incomplete",
+                error_message="Stream was closed before it was fully consumed",
+            )
+
     def _finalize(self, status: str, error_message: Optional[str]) -> None:
         if self._finalized:
             return
         self._finalized = True
         latency_ms = (time.perf_counter() - self._start_perf) * 1000.0
         self._acc.observe_snapshot(self._stream)
-        usage, joined_text = self._acc.build_final_usage(self._args, self._kwargs)
+        usage, joined_text = self._acc.build_final_usage(self._inputs)
         estimated = usage.estimated and not (
             self._explicit_input_tokens is not None and self._explicit_output_tokens is not None
         )
@@ -555,7 +787,7 @@ class _AsyncStreamProxy:
             or usage.detected_model
             or self._chosen_model
         )
-        cost_usd = self._tally._safe_calculate_cost(
+        cost_usd, priced = self._tally._safe_calculate_cost(
             model=final_model,
             input_tokens=in_tok,
             output_tokens=out_tok,
@@ -581,11 +813,11 @@ class _AsyncStreamProxy:
             retries=len(self._failed_attempts),
             error_message=error_message,
             attempt_errors=[a.to_dict() for a in self._failed_attempts],
-            args=self._args,
-            kwargs=self._kwargs,
+            inputs=self._inputs,
             response=joined_text or "<stream>",
             estimated_tokens=estimated,
             metadata=self._metadata,
+            unpriced=not priced,
         )
 
 
@@ -627,10 +859,14 @@ class LLMTally:
         log_backups: int = 3,
         async_sinks: bool = False,
         sink_queue_size: int = 10_000,
+        fallback_pricing: Optional[Tuple[float, float]] = None,
+        raise_original_error: bool = False,
+        dashboard_recent_calls: int = 500,
     ) -> None:
         """
         Every positional argument accepts `None` to mean "use the default":
-        `default_model="gpt-4o-mini"`, `log_path=".llm_tally/logs.jsonl"`,
+        `default_model=None` (no model is assumed; calls whose model can't be detected are logged
+        as `"unknown"` and flagged unpriced), `log_path=".llm_tally/logs.jsonl"`,
         `dashboard_path=".llm_tally/dashboard.html"`, `default_cache_enabled=False`,
         `default_retry_enabled=True`, `default_retries=3`, `retry_delays=(0.5, 1.0, 1.5)`,
         `auto_update_dashboard=True`. For `default_ttl`, `default_max_requests`, and
@@ -649,7 +885,7 @@ class LLMTally:
           is stored as `"[redaction failed]"` and the record is still kept.
         - `persist_logs=False` disables the JSONL file (use `on_record` sinks instead).
         - `max_log_mb` / `log_backups`: rotate the JSONL file to `<log>.1` ... `<log>.N` when it
-          would exceed this size. Reports and the dashboard only read the current file.
+          would exceed this size. Reports and the dashboard read the current file and backups.
         - `on_record`: callable(s) receiving every finished `CallRecord` (ship to a DB, OTel, ...).
         - `async_sinks=True` runs sinks on a background thread (bounded by `sink_queue_size`;
           records are dropped with a warning if it fills up) so slow sinks never delay LLM calls.
@@ -657,8 +893,16 @@ class LLMTally:
         - `metadata`: tags added to every record (e.g. `{"env": "prod"}`).
         - `retry_on_rate_limit`, `retry_jitter`, `max_retry_after`: HTTP 429 handling and backoff.
         - `pricing_file`: JSON file of model prices loaded on top of the built-in catalog.
+        - `fallback_pricing=(input_per_1m, output_per_1m)`: price unknown models at this rate
+          instead of $0. Those calls are still flagged `unpriced`.
+        - `raise_original_error=True`: when all retries fail, re-raise the SDK's own exception
+          (with `exc.llm_tally_attempts`) instead of `RetryExhaustedError`. With no retries
+          configured the original exception is always raised.
+        - `dashboard_recent_calls`: how many of the latest calls the dashboard's search table holds.
+
+        `LLM_TALLY_DIR` (environment variable) changes the default `.llm_tally` directory.
         """
-        self.default_model: str = str(default_model) if default_model else DEFAULT_MODEL
+        self.default_model: Optional[str] = str(default_model) if default_model else DEFAULT_MODEL
         self.log_path: Path = Path(log_path if log_path is not None else DEFAULT_LOG_PATH)
         self.dashboard_path: Path = Path(
             dashboard_path if dashboard_path is not None else DEFAULT_DASHBOARD_PATH
@@ -696,6 +940,15 @@ class LLMTally:
         self.retry_on_rate_limit: bool = bool(retry_on_rate_limit)
         self.retry_jitter: float = max(0.0, float(retry_jitter))
         self.max_retry_after: float = float(max_retry_after)
+        self.raise_original_error: bool = bool(raise_original_error)
+        self.fallback_pricing: Optional[Tuple[float, float]] = (
+            (float(fallback_pricing[0]), float(fallback_pricing[1]))
+            if fallback_pricing is not None
+            else None
+        )
+        self.dashboard_recent_calls: int = max(0, int(dashboard_recent_calls))
+        self._warned_models: set = set()
+        self._warned_lock = threading.Lock()
 
         self.cache_store = (
             cache_backend
@@ -922,7 +1175,43 @@ class LLMTally:
             retry_on_rate_limit=self.retry_on_rate_limit,
             jitter=self.retry_jitter,
             max_retry_after=self.max_retry_after,
+            raise_original=self.raise_original_error,
         )
+
+    @staticmethod
+    def _route_options(
+        func: Callable[..., Any],
+        options: Dict[str, Any],
+        kwargs: Dict[str, Any],
+        tally_options: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Decide which keyword arguments of `run()` / `cached_call()` / `retry_call()` belong to
+        `func`. An option whose name `func` declares as a parameter (e.g. `model` or `metadata`
+        on `client.chat.completions.create`) is passed through to `func` instead of being
+        consumed. `model` is also still used for pricing, and is passed through to functions
+        that take `**kwargs`. `tally_options={...}` always sets llm-tally options.
+        Mutates `kwargs`; returns the options llm-tally should use.
+        """
+        sig = _signature_of(func)
+        declared = _declared_params(func)
+        has_var_kw = sig is not None and any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        resolved = dict(options)
+        for name, value in options.items():
+            if value is None or value == () or name in kwargs:
+                continue
+            if name in declared or (name == "model" and has_var_kw):
+                kwargs[name] = value
+                if name != "model":
+                    resolved[name] = () if name == "extra_exceptions" else None
+        if tally_options:
+            unknown = set(tally_options) - set(options)
+            if unknown:
+                raise TypeError(f"unknown tally_options: {sorted(unknown)}")
+            resolved.update(tally_options)
+        return resolved
 
     def load_pricing(self, path: Union[str, Path]) -> int:
         """Load model prices from a JSON file (see `PricingRegistry.load_file`)."""
@@ -960,34 +1249,96 @@ class LLMTally:
         cached_input_tokens: int = 0,
         cache_creation_input_tokens: int = 0,
         input_excludes_cached: Optional[bool] = None,
-    ) -> float:
+        warn: bool = True,
+    ) -> Tuple[float, bool]:
         """
-        Compute cost for a completed LLM call. If warnings are configured as errors
-        (`-W error` or `pytest` `filterwarnings = ["error"]`), ensures a warning on an
-        unknown model never turns a successful paid LLM call into an exception.
+        Return `(cost_usd, priced)` for a completed call. A model with no known price is not
+        guessed: it costs 0 (or `fallback_pricing`, if configured) with `priced=False`, and a
+        warning is logged once per model. Never raises, so telemetry can't break a paid call.
         """
         try:
-            return self.pricing.calculate_cost(
-                model=model,
+            pricing = self.pricing.lookup(model)
+        except Exception as exc:
+            self._warn(f"llm-tally pricing lookup failed for model {model!r}: {exc}")
+            pricing = None
+        priced = pricing is not None
+        if pricing is None:
+            if warn:
+                self._warn_unpriced(model)
+            if self.fallback_pricing is None:
+                return 0.0, False
+            pricing = ModelPricing(
+                model=str(model),
+                provider="custom",
+                input_cost_per_1m=float(self.fallback_pricing[0]),
+                output_cost_per_1m=float(self.fallback_pricing[1]),
+            )
+        try:
+            cost = pricing.compute_cost(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 input_excludes_cached=input_excludes_cached,
-                warn_on_unknown=True,
             )
+        except Exception as exc:
+            self._warn(f"llm-tally could not compute cost for model {model!r}: {exc}")
+            return 0.0, False
+        return cost, priced
+
+    def _warn_unpriced(self, model: str) -> None:
+        key = str(model)
+        with self._warned_lock:
+            if key in self._warned_models:
+                return
+            self._warned_models.add(key)
+        if key == UNKNOWN_MODEL:
+            message = (
+                "llm-tally could not tell which model a call used, so it is logged as "
+                "'unknown' with no cost. Pass `model=` to the decorator, call the function with "
+                "`model=...`, or return the SDK response object (which reports its model)."
+            )
+        else:
+            message = (
+                f"llm-tally has no price for model {key!r}; its calls are logged as unpriced "
+                f"(cost {'from fallback_pricing' if self.fallback_pricing else '$0'}) and flagged on "
+                f"the dashboard. Set a price with `tally.register_model({key!r}, input_cost_per_1m=..., "
+                "output_cost_per_1m=...)` or `pricing_file=`; earlier calls are re-priced in reports."
+            )
+        # Apps with logging configured get it in their logs; otherwise a UserWarning that
+        # points at the calling line
+        if logger.hasHandlers():
+            logger.warning(message)
+            return
+        try:
+            warnings.warn(message, UserWarning, stacklevel=5)
         except Warning:
-            return self.pricing.calculate_cost(
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
-                cache_creation_input_tokens=cache_creation_input_tokens,
-                input_excludes_cached=input_excludes_cached,
-                warn_on_unknown=False,
+            pass
+
+    def _cache_key_for(
+        self,
+        func: Callable[..., Any],
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        feature: str,
+        model: str,
+        cfg_dict: Dict[str, Any],
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """
+        Build the cache key, or return `(None, {})` (no caching for this call) if the inputs
+        can't be hashed, e.g. a very deep object graph on `self`. Never raises.
+        """
+        settings = {"feature": feature, "model": model, "config": cfg_dict}
+        try:
+            return build_cache_key(
+                self._func_identifier(func), args, kwargs, settings=settings, func=func
             )
-        except Exception:
-            return 0.0
+        except (RecursionError, Exception) as exc:
+            self._warn(
+                f"llm-tally could not build a cache key for {self._func_identifier(func)} "
+                f"({type(exc).__name__}); the call runs without caching"
+            )
+            return None, {}
 
     # -------------------------------------------------------------------------
     # Feature 1: Explicit Self-Evicting In-Memory Cache Function & Decorator
@@ -1004,25 +1355,70 @@ class LLMTally:
         track_cost: bool = True,
         retry: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
+        tally_options: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
         Feature 1 Explicit Function: Execute `func(*args, **kwargs)` using the local
         in-memory cache (always on here, regardless of `default_cache_enabled`).
         With `track_cost=False` and `retry=False` nothing is logged; otherwise this is
-        `run(..., cache=True)`.
+        `run(..., cache=True)`. Options that `func` itself declares are passed to `func`
+        (see `run`).
         """
+        opts = self._route_options(
+            func,
+            {"ttl": ttl, "max_requests": max_requests, "config": config, "model": model,
+             "feature": feature, "metadata": metadata},
+            kwargs,
+            tally_options,
+        )
+        return self._cached_call_impl(
+            func,
+            args,
+            kwargs,
+            ttl=opts["ttl"],
+            max_requests=opts["max_requests"],
+            config=opts["config"],
+            model=opts["model"],
+            feature=opts["feature"],
+            track_cost=track_cost,
+            retry=retry,
+            metadata=opts["metadata"],
+        )
+
+    def _cached_call_impl(
+        self,
+        func: Callable[..., Any],
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        ttl: Optional[float],
+        max_requests: Optional[int],
+        config: Optional[Dict[str, Any]],
+        model: Optional[str],
+        feature: Optional[str],
+        track_cost: bool,
+        retry: bool,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
         if not track_cost and not retry:
             effective_ttl = self.default_ttl if ttl is None else ttl
             effective_max_req = self.default_max_requests if max_requests is None else max_requests
             func_name = self._func_identifier(func)
             settings_meta = {
                 "config": config or {},
-                "model": model or _call_time_model(kwargs) or self.default_model,
+                "model": model or _call_time_model(func, args, kwargs) or self.default_model,
             }
-            key, snapshot = build_cache_key(
-                func_name, args, kwargs, settings=settings_meta, func=func
-            )
+            try:
+                key: Optional[str]
+                key, snapshot = build_cache_key(
+                    func_name, args, kwargs, settings=settings_meta, func=func
+                )
+            except (RecursionError, Exception) as exc:
+                self._warn(
+                    f"llm-tally could not build a cache key for {func_name} "
+                    f"({type(exc).__name__}); the call runs without caching"
+                )
+                return func(*args, **kwargs)
 
             if inspect.iscoroutinefunction(func):
 
@@ -1057,9 +1453,10 @@ class LLMTally:
             )
             return res
 
-        return self.run(
+        return self._dispatch(
             func,
-            *args,
+            args,
+            kwargs,
             feature=feature or getattr(func, "__name__", "cached_call"),
             model=model,
             config=config,
@@ -1068,7 +1465,6 @@ class LLMTally:
             max_requests=max_requests,
             retry=retry,
             metadata=metadata,
-            **kwargs,
         )
 
     def cache(
@@ -1087,41 +1483,27 @@ class LLMTally:
         """
 
         def _decorator(func: F) -> F:
+            options = dict(
+                ttl=ttl,
+                max_requests=max_requests,
+                config=config,
+                feature=feature or getattr(func, "__name__", "cached_call"),
+                model=model,
+                track_cost=track_cost,
+                retry=retry,
+                metadata=metadata,
+            )
             if inspect.iscoroutinefunction(func):
 
                 @functools.wraps(func)
                 async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    return await self.cached_call(
-                        func,
-                        *args,
-                        ttl=ttl,
-                        max_requests=max_requests,
-                        config=config,
-                        feature=feature or getattr(func, "__name__", "cached_call"),
-                        model=model,
-                        track_cost=track_cost,
-                        retry=retry,
-                        metadata=metadata,
-                        **kwargs,
-                    )
+                    return await self._cached_call_impl(func, args, kwargs, **options)
 
                 return _async_wrapper  # type: ignore[return-value]
 
             @functools.wraps(func)
             def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                return self.cached_call(
-                    func,
-                    *args,
-                    ttl=ttl,
-                    max_requests=max_requests,
-                    config=config,
-                    feature=feature or getattr(func, "__name__", "cached_call"),
-                    model=model,
-                    track_cost=track_cost,
-                    retry=retry,
-                    metadata=metadata,
-                    **kwargs,
-                )
+                return self._cached_call_impl(func, args, kwargs, **options)
 
             return _sync_wrapper  # type: ignore[return-value]
 
@@ -1137,12 +1519,22 @@ class LLMTally:
         retries: Optional[int] = None,
         retry_delays: Optional[Sequence[float]] = None,
         extra_exceptions: Tuple[Type[BaseException], ...] = (),
+        tally_options: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
         Feature 2 Explicit Function: Execute `func(*args, **kwargs)` with automatic
-        retries on HTTP 500/5xx or network issues.
+        retries on HTTP 500/5xx or network issues. Options that `func` declares are passed
+        to `func` (see `run`).
         """
+        opts = self._route_options(
+            func,
+            {"retries": retries, "retry_delays": retry_delays, "extra_exceptions": extra_exceptions},
+            kwargs,
+            tally_options,
+        )
+        retries, retry_delays = opts["retries"], opts["retry_delays"]
+        extra_exceptions = tuple(opts["extra_exceptions"] or ())
         cfg = self._retry_config(
             enabled=True,
             retries=self.default_retries if retries is None else retries,
@@ -1268,30 +1660,69 @@ class LLMTally:
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        tally_options: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Execute `func(*args, **kwargs)` directly with caching, retries, and cost tracking."""
+        """
+        Execute `func(*args, **kwargs)` directly with caching, retries, and cost tracking.
+
+        Keyword arguments that `func` declares are passed to `func`, never swallowed. So
+        `tally.run(client.chat.completions.create, model="gpt-4o", messages=..., metadata={...})`
+        sends `model` and `metadata` to the SDK (and prices the call as `gpt-4o`). Use
+        `tally_options={"metadata": {...}, "feature": ...}` to set llm-tally options whose
+        names collide with `func`'s parameters.
+        """
+        opts = self._route_options(
+            func,
+            {"feature": feature, "model": model, "config": config, "cache": cache, "ttl": ttl,
+             "max_requests": max_requests, "retry": retry, "retries": retries,
+             "retry_delays": retry_delays, "extra_exceptions": extra_exceptions,
+             "input_tokens": input_tokens, "output_tokens": output_tokens, "metadata": metadata},
+            kwargs,
+            tally_options,
+        )
+        return self._dispatch(
+            func,
+            args,
+            kwargs,
+            feature=opts["feature"],
+            model=opts["model"],
+            config=opts["config"],
+            cache=opts["cache"],
+            ttl=opts["ttl"],
+            max_requests=opts["max_requests"],
+            retry=opts["retry"],
+            retries=opts["retries"],
+            retry_delays=opts["retry_delays"],
+            extra_exceptions=tuple(opts["extra_exceptions"] or ()),
+            input_tokens=opts["input_tokens"],
+            output_tokens=opts["output_tokens"],
+            metadata=opts["metadata"],
+        )
+
+    def _dispatch(
+        self,
+        func: Callable[..., Any],
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        feature: Optional[str] = None,
+        model: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        cache: Optional[bool] = None,
+        ttl: Optional[float] = None,
+        max_requests: Optional[int] = None,
+        retry: Optional[bool] = None,
+        retries: Optional[int] = None,
+        retry_delays: Optional[Sequence[float]] = None,
+        extra_exceptions: Tuple[Type[BaseException], ...] = (),
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Run `func(*args, **kwargs)` through the sync or async pipeline (kwargs go to `func`)."""
         feat_name = feature or getattr(func, "__name__", "default")
-        if inspect.iscoroutinefunction(func):
-            return self._execute_async(
-                func=func,
-                args=args,
-                kwargs=kwargs,
-                feature=feat_name,
-                model=model,
-                config=config,
-                cache=cache,
-                ttl=ttl,
-                max_requests=max_requests,
-                retry=retry,
-                retries=retries,
-                retry_delays=retry_delays,
-                extra_exceptions=extra_exceptions,
-                explicit_input_tokens=input_tokens,
-                explicit_output_tokens=output_tokens,
-                metadata=metadata,
-            )
-        return self._execute_sync(
+        execute = self._execute_async if inspect.iscoroutinefunction(func) else self._execute_sync
+        return execute(
             func=func,
             args=args,
             kwargs=kwargs,
@@ -1331,8 +1762,7 @@ class LLMTally:
         failed_attempts: List[AttemptFailure],
         explicit_input_tokens: Optional[int],
         explicit_output_tokens: Optional[int],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        inputs: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
@@ -1340,7 +1770,7 @@ class LLMTally:
         and return a transparent `_SyncStreamProxy` or `_AsyncStreamProxy` that updates
         the record in-place as the stream is consumed or closed.
         """
-        initial_usage = extract_token_usage("", args=args, kwargs=kwargs)
+        initial_usage = extract_token_usage("", inputs=inputs)
         in_tok = (
             explicit_input_tokens
             if explicit_input_tokens is not None
@@ -1348,10 +1778,11 @@ class LLMTally:
         )
         out_tok = explicit_output_tokens if explicit_output_tokens is not None else 0
         final_model = str(model or cfg_dict.get("model") or chosen_model)
-        initial_cost = self._safe_calculate_cost(
+        initial_cost, priced = self._safe_calculate_cost(
             model=final_model,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            warn=False,
         )
         latency_ms = (time.perf_counter() - start_perf) * 1000.0
         rec = self._record_call(
@@ -1359,7 +1790,8 @@ class LLMTally:
             function_name=func_short,
             model=final_model,
             config=cfg_dict,
-            status="success",
+            # Replaced by the final record once the stream finishes, fails, or is abandoned
+            status="streaming",
             cache_hit=False,
             latency_ms=latency_ms,
             input_tokens=in_tok,
@@ -1367,11 +1799,11 @@ class LLMTally:
             cached_input_tokens=0,
             cache_creation_input_tokens=0,
             cost_usd=initial_cost,
+            unpriced=not priced,
             retries=len(failed_attempts),
             error_message=None,
             attempt_errors=[a.to_dict() for a in failed_attempts],
-            args=args,
-            kwargs=kwargs,
+            inputs=inputs,
             response="<stream>",
             metadata=metadata,
             # Sinks get the finished record from the proxy, not this placeholder
@@ -1401,8 +1833,7 @@ class LLMTally:
                 failed_attempts=failed_attempts,
                 explicit_input_tokens=explicit_input_tokens,
                 explicit_output_tokens=explicit_output_tokens,
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 metadata=metadata,
             )
         return _SyncStreamProxy(
@@ -1419,8 +1850,7 @@ class LLMTally:
             failed_attempts=failed_attempts,
             explicit_input_tokens=explicit_input_tokens,
             explicit_output_tokens=explicit_output_tokens,
-            args=args,
-            kwargs=kwargs,
+            inputs=inputs,
             metadata=metadata,
         )
 
@@ -1449,19 +1879,25 @@ class LLMTally:
         use_retry = self.default_retry_enabled if retry is None else retry
         effective_retries = self.default_retries if retries is None else retries
         effective_delays = self.retry_delays if retry_delays is None else tuple(retry_delays)
-        call_model = _call_time_model(kwargs)
+        call_model = _call_time_model(func, args, kwargs)
         chosen_model = (
-            model or (config or {}).get("model") or call_model or self.default_model
+            model
+            or (config or {}).get("model")
+            or call_model
+            or self.default_model
+            or UNKNOWN_MODEL
         )
         meta = self._resolve_metadata(metadata)
         cfg_dict = dict(config or {})
+        inputs = _call_inputs(func, args, kwargs)
 
-        func_id = self._func_identifier(func)
         func_short = getattr(func, "__qualname__", getattr(func, "__name__", "callable"))
-        cache_settings = {"feature": feature, "model": chosen_model, "config": cfg_dict}
-        cache_key, snapshot = build_cache_key(
-            func_id, args, kwargs, settings=cache_settings, func=func
+        cache_key, snapshot = (
+            self._cache_key_for(func, args, kwargs, feature, chosen_model, cfg_dict)
+            if use_cache
+            else (None, {})
         )
+        use_cache = cache_key is not None
 
         start_perf = time.perf_counter()
 
@@ -1486,8 +1922,7 @@ class LLMTally:
                     retries=0,
                     error_message=None,
                     attempt_errors=[],
-                    args=args,
-                    kwargs=kwargs,
+                    inputs=inputs,
                     response=cached_output,
                     metadata=meta,
                 )
@@ -1526,8 +1961,7 @@ class LLMTally:
                 retries=max(0, len(exc.attempts) - 1),
                 error_message=str(exc),
                 attempt_errors=[a.to_dict() for a in exc.attempts],
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 response=None,
                 metadata=meta,
             )
@@ -1551,8 +1985,7 @@ class LLMTally:
                 retries=max(0, len(prior_attempts) - 1),
                 error_message=f"{type(exc).__name__}: {exc}",
                 attempt_errors=[a.to_dict() for a in prior_attempts],
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 response=None,
                 metadata=meta,
             )
@@ -1571,8 +2004,7 @@ class LLMTally:
                 failed_attempts=failed_attempts,
                 explicit_input_tokens=explicit_input_tokens,
                 explicit_output_tokens=explicit_output_tokens,
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 metadata=meta,
             )
 
@@ -1590,7 +2022,7 @@ class LLMTally:
             )
 
         # 5. Extract Token Usage & Compute Cost Safely
-        usage = extract_token_usage(result, args=args, kwargs=kwargs)
+        usage = extract_token_usage(result, inputs=inputs)
         in_tok = explicit_input_tokens if explicit_input_tokens is not None else usage.input_tokens
         out_tok = (
             explicit_output_tokens if explicit_output_tokens is not None else usage.output_tokens
@@ -1601,11 +2033,12 @@ class LLMTally:
             or usage.detected_model
             or call_model
             or self.default_model
+            or UNKNOWN_MODEL
         )
         estimated = usage.estimated and not (
             explicit_input_tokens is not None and explicit_output_tokens is not None
         )
-        cost_usd = self._safe_calculate_cost(
+        cost_usd, priced = self._safe_calculate_cost(
             model=final_model,
             input_tokens=in_tok,
             output_tokens=out_tok,
@@ -1630,11 +2063,11 @@ class LLMTally:
             retries=len(failed_attempts),
             error_message=None,
             attempt_errors=[a.to_dict() for a in failed_attempts],
-            args=args,
-            kwargs=kwargs,
+            inputs=inputs,
             response=result,
             metadata=meta,
             estimated_tokens=estimated,
+            unpriced=not priced,
         )
         return result
 
@@ -1663,19 +2096,25 @@ class LLMTally:
         use_retry = self.default_retry_enabled if retry is None else retry
         effective_retries = self.default_retries if retries is None else retries
         effective_delays = self.retry_delays if retry_delays is None else tuple(retry_delays)
-        call_model = _call_time_model(kwargs)
+        call_model = _call_time_model(func, args, kwargs)
         chosen_model = (
-            model or (config or {}).get("model") or call_model or self.default_model
+            model
+            or (config or {}).get("model")
+            or call_model
+            or self.default_model
+            or UNKNOWN_MODEL
         )
         meta = self._resolve_metadata(metadata)
         cfg_dict = dict(config or {})
+        inputs = _call_inputs(func, args, kwargs)
 
-        func_id = self._func_identifier(func)
         func_short = getattr(func, "__qualname__", getattr(func, "__name__", "callable"))
-        cache_settings = {"feature": feature, "model": chosen_model, "config": cfg_dict}
-        cache_key, snapshot = build_cache_key(
-            func_id, args, kwargs, settings=cache_settings, func=func
+        cache_key, snapshot = (
+            self._cache_key_for(func, args, kwargs, feature, chosen_model, cfg_dict)
+            if use_cache
+            else (None, {})
         )
+        use_cache = cache_key is not None
 
         start_perf = time.perf_counter()
 
@@ -1700,8 +2139,7 @@ class LLMTally:
                     retries=0,
                     error_message=None,
                     attempt_errors=[],
-                    args=args,
-                    kwargs=kwargs,
+                    inputs=inputs,
                     response=cached_output,
                     metadata=meta,
                 )
@@ -1740,8 +2178,7 @@ class LLMTally:
                 retries=max(0, len(exc.attempts) - 1),
                 error_message=str(exc),
                 attempt_errors=[a.to_dict() for a in exc.attempts],
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 response=None,
                 metadata=meta,
             )
@@ -1765,8 +2202,7 @@ class LLMTally:
                 retries=max(0, len(prior_attempts) - 1),
                 error_message=f"{type(exc).__name__}: {exc}",
                 attempt_errors=[a.to_dict() for a in prior_attempts],
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 response=None,
                 metadata=meta,
             )
@@ -1785,8 +2221,7 @@ class LLMTally:
                 failed_attempts=failed_attempts,
                 explicit_input_tokens=explicit_input_tokens,
                 explicit_output_tokens=explicit_output_tokens,
-                args=args,
-                kwargs=kwargs,
+                inputs=inputs,
                 metadata=meta,
             )
 
@@ -1804,7 +2239,7 @@ class LLMTally:
             )
 
         # 5. Extract Token Usage & Compute Cost Safely
-        usage = extract_token_usage(result, args=args, kwargs=kwargs)
+        usage = extract_token_usage(result, inputs=inputs)
         in_tok = explicit_input_tokens if explicit_input_tokens is not None else usage.input_tokens
         out_tok = (
             explicit_output_tokens if explicit_output_tokens is not None else usage.output_tokens
@@ -1815,11 +2250,12 @@ class LLMTally:
             or usage.detected_model
             or call_model
             or self.default_model
+            or UNKNOWN_MODEL
         )
         estimated = usage.estimated and not (
             explicit_input_tokens is not None and explicit_output_tokens is not None
         )
-        cost_usd = self._safe_calculate_cost(
+        cost_usd, priced = self._safe_calculate_cost(
             model=final_model,
             input_tokens=in_tok,
             output_tokens=out_tok,
@@ -1844,11 +2280,11 @@ class LLMTally:
             retries=len(failed_attempts),
             error_message=None,
             attempt_errors=[a.to_dict() for a in failed_attempts],
-            args=args,
-            kwargs=kwargs,
+            inputs=inputs,
             response=result,
             metadata=meta,
             estimated_tokens=estimated,
+            unpriced=not priced,
         )
         return result
 
@@ -1868,13 +2304,13 @@ class LLMTally:
         retries: int,
         error_message: Optional[str],
         attempt_errors: List[Dict[str, Any]],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        inputs: Dict[str, Any],
         response: Any,
         cache_creation_input_tokens: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
         estimated_tokens: bool = False,
         emit: bool = True,
+        unpriced: bool = False,
     ) -> Optional[CallRecord]:
         return self._persist_record(
             record_id=uuid.uuid4().hex[:12],
@@ -1895,12 +2331,12 @@ class LLMTally:
             retries=retries,
             error_message=error_message,
             attempt_errors=attempt_errors,
-            args=args,
-            kwargs=kwargs,
+            inputs=inputs,
             response=response,
             cache_creation_input_tokens=cache_creation_input_tokens,
             metadata=metadata,
             estimated_tokens=estimated_tokens,
+            unpriced=unpriced,
         )
 
     def _update_recorded_call(
@@ -1921,12 +2357,12 @@ class LLMTally:
         retries: int,
         error_message: Optional[str],
         attempt_errors: List[Dict[str, Any]],
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        inputs: Dict[str, Any],
         response: Any,
         cache_creation_input_tokens: int = 0,
         metadata: Optional[Dict[str, Any]] = None,
         estimated_tokens: bool = False,
+        unpriced: bool = False,
     ) -> Optional[CallRecord]:
         return self._persist_record(
             record_id=record_id,
@@ -1947,12 +2383,12 @@ class LLMTally:
             retries=retries,
             error_message=error_message,
             attempt_errors=attempt_errors,
-            args=args,
-            kwargs=kwargs,
+            inputs=inputs,
             response=response,
             cache_creation_input_tokens=cache_creation_input_tokens,
             metadata=metadata,
             estimated_tokens=estimated_tokens,
+            unpriced=unpriced,
         )
 
     def _persist_record(
@@ -1961,8 +2397,7 @@ class LLMTally:
         timestamp: str,
         update: bool,
         emit: bool,
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        inputs: Dict[str, Any],
         response: Any,
         metadata: Optional[Dict[str, Any]],
         latency_ms: float,
@@ -1980,8 +2415,8 @@ class LLMTally:
                 id=record_id,
                 timestamp=timestamp,
                 latency_ms=round(latency_ms, 2),
-                input_preview=self._preview({"args": args, "kwargs": kwargs}),
-                output_preview=self._preview(response),
+                input_preview=self._preview(_input_preview_value(inputs)),
+                output_preview=self._preview(_response_text(response)),
                 metadata=dict(metadata or {}),
                 **fields,
             )
@@ -1989,19 +2424,27 @@ class LLMTally:
             self._warn(f"llm-tally failed to build telemetry record: {build_exc}")
             return None
 
+        logged = False
         if self.persist_logs:
             try:
                 if update:
                     self.logger.update(record)
                 else:
                     self.logger.append(record)
-                self._maybe_update_dashboard()
+                logged = True
             except Exception as log_exc:
-                verb = "update stream telemetry log" if update else "write telemetry log or dashboard"
+                verb = "update stream telemetry log" if update else "write telemetry log"
                 self._warn(f"llm-tally failed to {verb}: {log_exc}")
-                return None
+            if logged:
+                try:
+                    self._maybe_update_dashboard()
+                except Exception as dash_exc:
+                    self._warn(f"llm-tally failed to write dashboard: {dash_exc}")
+        # Sinks are independent of the local file: a read-only filesystem must not lose records
         if emit:
             self._emit_to_sinks(record)
+        if self.persist_logs and not logged and not self.sinks:
+            return None
         return record
 
     @staticmethod
@@ -2033,9 +2476,35 @@ class LLMTally:
                     self._dashboard_timer = timer
                     timer.start()
                 return
+            if not self._inline_dashboard_ok():
+                # A large log takes a while to rebuild: never block the caller (or the event loop)
+                self._dashboard_dirty = True
+                if self._dashboard_timer is None:
+                    timer = threading.Timer(0.0, self._flush_from_timer)
+                    timer.daemon = True
+                    self._dashboard_timer = timer
+                    timer.start()
+                return
             self._last_dashboard_write = now
             self._dashboard_dirty = False
         self.generate_dashboard()
+
+    def _inline_dashboard_ok(self) -> bool:
+        """Rebuild inline only while it is cheap (small log and fast previous builds)."""
+        if self._last_dashboard_build_seconds > _INLINE_DASHBOARD_MAX_SECONDS:
+            return False
+        try:
+            size = os.path.getsize(self.log_path)
+        except OSError:
+            return True
+        return size <= _INLINE_DASHBOARD_MAX_LOG_BYTES
+
+    def _reset_after_fork(self) -> None:
+        """A forked child inherits lock state but not threads: start clean."""
+        self._dashboard_lock = threading.Lock()
+        self._dashboard_timer = None
+        self._sink_start_lock = threading.Lock()
+        self._warned_lock = threading.Lock()
 
     def _flush_from_timer(self) -> None:
         with self._dashboard_lock:
@@ -2065,9 +2534,18 @@ class LLMTally:
     # -------------------------------------------------------------------------
     # Feature 3: Analytics & Dashboard Generation
     # -------------------------------------------------------------------------
+    def _load_records(self, days: Optional[float], now: Optional[datetime] = None, copy: bool = False) -> List[CallRecord]:
+        """Records from the log and its rotated backups, with newly priced models re-priced."""
+        records = self.logger.read_all(copy_records=copy, include_backups=True)
+        return reprice_records(filter_records_since(records, days, now=now), self.pricing)
+
     def get_records(self, days: Optional[float] = None) -> List[CallRecord]:
-        """Read logged call records from the JSONL file (only the last `days` days if given)."""
-        return filter_records_since(self.logger.read_all(), days)
+        """
+        Read logged call records (current log file plus rotated backups; only the last `days`
+        days if given). Calls to models that were unpriced when logged but have a price now are
+        returned re-priced.
+        """
+        return self._load_records(days, copy=True)
 
     def get_report(
         self,
@@ -2082,8 +2560,8 @@ class LLMTally:
         - `latency_stats` / `slowest_calls`: Which calls are slow?
         - `metadata_costs`: Which user / tenant / prompt version (any metadata key) costs the most?
         """
-        records = filter_records_since(self.logger.read_all(copy_records=False), days, now=now)
-        return analyze_logs(records, now=now)
+        records = self._load_records(days, now=now)
+        return analyze_logs(records, now=now, recent_limit=self.dashboard_recent_calls)
 
     def render_dashboard(
         self,
@@ -2092,8 +2570,8 @@ class LLMTally:
     ) -> str:
         """Render the self-contained HTML dashboard as a string."""
         window = self.dashboard_days if days is None else days
-        records = filter_records_since(self.logger.read_all(copy_records=False), window)
-        return render_dashboard_html(records, title=title)
+        records = self._load_records(window)
+        return render_dashboard_html(records, title=title, recent_limit=self.dashboard_recent_calls)
 
     def generate_dashboard(
         self,
@@ -2105,8 +2583,10 @@ class LLMTally:
         target = Path(dashboard_path) if dashboard_path is not None else self.dashboard_path
         window = self.dashboard_days if days is None else days
         started = time.perf_counter()
-        records = filter_records_since(self.logger.read_all(copy_records=False), window)
-        path = write_dashboard_file(records, dashboard_path=target, title=title)
+        records = self._load_records(window)
+        path = write_dashboard_file(
+            records, dashboard_path=target, title=title, recent_limit=self.dashboard_recent_calls
+        )
         self._last_dashboard_build_seconds = time.perf_counter() - started
         return path
 

@@ -11,11 +11,12 @@
 <body>
 
 <header>
-  <div>
-    <h1>{{TITLE}}</h1>
-    <div class="subtitle" id="headerSubtitle"></div>
-  </div>
+  <h1>{{TITLE}}</h1>
+  <div class="subtitle" id="headerSubtitle"></div>
 </header>
+
+<!-- Data-quality notices: unpriced models, estimated tokens -->
+<div id="notices"></div>
 
 <!-- Direct Answers to the 4 Core Questions -->
 <div class="questions-grid">
@@ -37,33 +38,35 @@
   <div class="q-card">
     <div class="q-title">4. Which calls are slow?</div>
     <div class="q-answer" id="q4Answer">N/A</div>
-    <div class="q-sub">Ranked by average &amp; P95 execution latency</div>
+    <div class="q-sub">Average latency of live calls (cache hits and failed calls left out)</div>
   </div>
 </div>
 
 <!-- 7-Day Spend Breakdown -->
 <div class="section">
-  <h2>Weekly Spend Breakdown (Last 7 Days)</h2>
-  <div class="sec-desc">Daily LLM cost and call volume answering &ldquo;How much money did I spend this week?&rdquo;</div>
-  <div class="weekly-chart" id="weeklyChart"></div>
+  <h2>Spend over the last 7 days</h2>
+  <div class="sec-desc" id="weeklyDesc">Daily LLM cost and call volume.</div>
+  <div class="chart-scroll">
+    <div class="weekly-chart" id="weeklyChart"></div>
+  </div>
 </div>
 
 <!-- Feature & Config Cost Breakdown -->
 <div class="section">
-  <h2>Cost by Feature &amp; Configuration (&ldquo;Which feature costs the most?&rdquo;)</h2>
-  <div class="sec-desc">Breakdown of cost per feature and per configuration settings, sorted from highest to lowest spend.</div>
-  <div style="overflow-x:auto;">
+  <h2>Cost by feature and configuration</h2>
+  <div class="sec-desc">One row per feature and config, sorted by spend. The top-feature card above adds up all configs of a feature.</div>
+  <div class="table-scroll">
     <table>
       <thead>
         <tr>
           <th>Feature</th>
-          <th>Config Settings</th>
+          <th>Config</th>
           <th>Models</th>
-          <th class="num">Total Cost</th>
-          <th class="num">This Week</th>
-          <th>Share of Spend</th>
+          <th class="num">Total cost</th>
+          <th class="num">Last 7 days</th>
+          <th>Share of spend</th>
           <th class="num">Calls</th>
-          <th class="num">In / Out Tokens</th>
+          <th class="num">In / out tokens</th>
         </tr>
       </thead>
       <tbody id="featureCostsBody"></tbody>
@@ -73,15 +76,15 @@
 
 <!-- Cost by per-call metadata (shown only when calls carry metadata) -->
 <div class="section" id="metadataSection" hidden>
-  <h2>Cost by Metadata (&ldquo;Which user, tenant, or prompt version costs the most?&rdquo;)</h2>
-  <div class="sec-desc">Spend grouped by each metadata key attached with <code>metadata=</code> or <code>tally.context(...)</code> (top 25 values per key).</div>
-  <div style="overflow-x:auto;">
+  <h2>Cost by metadata</h2>
+  <div class="sec-desc">Spend grouped by each metadata key attached with <code>metadata=</code> or <code>tally.context(...)</code> (top 25 values per key). Answers &ldquo;which user, tenant, or prompt version costs the most?&rdquo;</div>
+  <div class="table-scroll">
     <table>
       <thead>
         <tr>
           <th>Key</th>
           <th>Value</th>
-          <th class="num">Total Cost</th>
+          <th class="num">Total cost</th>
           <th class="num">Calls</th>
         </tr>
       </thead>
@@ -90,77 +93,77 @@
   </div>
 </div>
 
-<div class="two-col">
-  <!-- Which calls fail the most? -->
-  <div class="section">
-    <h2>Failure &amp; Retry Analysis (&ldquo;Which calls fail the most?&rdquo;)</h2>
-    <div class="sec-desc">Tracks HTTP 5xx, 429 rate-limit, and network retry attempts and exhausted failures.</div>
-    <div style="overflow-x:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Feature</th>
-            <th>Function</th>
-            <th class="num">Failures / Rate</th>
-            <th class="num">Retries</th>
-            <th>Last Error</th>
-          </tr>
-        </thead>
-        <tbody id="failureStatsBody"></tbody>
-      </table>
-    </div>
+<!-- Which calls fail the most? -->
+<div class="section">
+  <h2>Failures and retries</h2>
+  <div class="sec-desc">Functions with at least one failed call or retry (HTTP 5xx, 429 rate limits, network errors). Click an error to read all of it.</div>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Feature</th>
+          <th>Function</th>
+          <th class="num">Failed / calls</th>
+          <th class="num">Retries</th>
+          <th>Last error</th>
+        </tr>
+      </thead>
+      <tbody id="failureStatsBody"></tbody>
+    </table>
   </div>
+</div>
 
-  <!-- Which calls are slow? -->
-  <div class="section">
-    <h2>Latency Leaderboard (&ldquo;Which calls are slow?&rdquo;)</h2>
-    <div class="sec-desc">Average, 95th percentile (P95), and maximum response times per feature.</div>
-    <div style="overflow-x:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Feature</th>
-            <th>Function</th>
-            <th>Models</th>
-            <th class="num">Avg Latency</th>
-            <th class="num">P95</th>
-            <th class="num">Max</th>
-            <th class="num">Calls</th>
-          </tr>
-        </thead>
-        <tbody id="latencyStatsBody"></tbody>
-      </table>
-    </div>
+<!-- Which calls are slow? -->
+<div class="section">
+  <h2>Latency</h2>
+  <div class="sec-desc">Average, 95th percentile (P95), and maximum of live calls per function. Streams are measured until the caller finishes reading them.</div>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Feature</th>
+          <th>Function</th>
+          <th>Models</th>
+          <th class="num">Avg</th>
+          <th class="num">P95</th>
+          <th class="num">Max</th>
+          <th class="num">Live / all calls</th>
+        </tr>
+      </thead>
+      <tbody id="latencyStatsBody"></tbody>
+    </table>
   </div>
 </div>
 
 <!-- Searchable Call Explorer -->
 <div class="section">
-  <h2>Search Call Logs</h2>
-  <div class="sec-desc">Search by feature name, model, config settings, metadata, input/output preview, or error message. Costs marked <strong>~</strong> are estimated from text length because the response had no token usage.</div>
+  <h2>Search call logs</h2>
+  <div class="sec-desc" id="callsDesc"></div>
   <div class="search-bar">
-    <input type="search" id="searchInput" placeholder="Search feature, model, config, input, output, or error..." />
-    <select id="statusFilter">
-      <option value="all">All Statuses</option>
-      <option value="success">Success (Live Call)</option>
-      <option value="cached">Cached Hit</option>
+    <input type="search" id="searchInput" aria-label="Search calls" placeholder="Search feature, model, config, metadata, input, output, or error..." />
+    <select id="statusFilter" aria-label="Filter by status">
+      <option value="all">All statuses</option>
+      <option value="success">Success</option>
+      <option value="cached">Cache hit</option>
       <option value="failed">Failed</option>
-      <option value="incomplete">Incomplete Stream</option>
+      <option value="incomplete">Incomplete stream</option>
+      <option value="streaming">Still streaming</option>
+      <option value="unpriced">No price (unpriced model)</option>
     </select>
   </div>
-  <div style="overflow-x:auto;">
+  <div class="table-scroll">
     <table id="callsTable">
       <thead>
         <tr>
-          <th>Timestamp (UTC)</th>
+          <th id="timeHeader">Time</th>
           <th>Feature</th>
           <th>Model</th>
           <th>Status</th>
           <th class="num">Cost</th>
           <th class="num">Latency</th>
-          <th class="num">Tokens (In/Out)</th>
+          <th class="num">Tokens in / out</th>
           <th class="num">Retries</th>
-          <th>Config / Details</th>
+          <th>Details</th>
         </tr>
       </thead>
       <tbody id="callsTableBody"></tbody>
@@ -168,10 +171,11 @@
   </div>
 </div>
 
+<footer id="footer"></footer>
+
 <script>
 const REPORT_DATA = {{REPORT_JSON}};
 {{DASHBOARD_JS}}
 </script>
 </body>
 </html>
-

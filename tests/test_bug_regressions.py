@@ -760,7 +760,10 @@ class TestAll15BugRegressions(unittest.TestCase):
 
             records = tally.get_records()
             self.assertEqual(len(records), 1)
-            self.assertGreater(records[0].cost_usd, 0.0)
+            # Unknown models are not priced with a made-up rate: cost 0, flagged unpriced
+            self.assertEqual(records[0].cost_usd, 0.0)
+            self.assertTrue(records[0].unpriced)
+            self.assertEqual(records[0].input_tokens, 1000)
 
     # ------------------------------------------------------------------
     # Issue J: Result holding an unpicklable lock still clones mutable fields

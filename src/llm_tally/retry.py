@@ -9,7 +9,9 @@ Default behavior:
   extends the wait, capped at `max_retry_after` seconds.
 - Optional `jitter` adds up to `jitter * delay` random extra wait to spread out retries.
 - If all attempts fail, raises `RetryExhaustedError` containing the complete list of
-  errors from every attempt.
+  errors from every attempt. With `raise_original=True` (or when no retries are configured)
+  the last original exception is re-raised instead, with the attempt history attached as
+  `exc.llm_tally_attempts`, so `except openai.RateLimitError:` handlers keep working.
 """
 
 from __future__ import annotations
@@ -83,6 +85,8 @@ class RetryConfig:
     retry_on_rate_limit: bool = True
     jitter: float = 0.0
     max_retry_after: float = 60.0
+    # Re-raise the last original exception instead of `RetryExhaustedError` when all attempts fail
+    raise_original: bool = False
 
     def get_delay_for_retry(self, retry_index: int) -> float:
         """
@@ -359,13 +363,58 @@ def is_retryable_exception(
     return False, status_code
 
 
+def _returned_http_status(result: Any) -> Optional[int]:
+    """
+    HTTP status of a *returned* value, read conservatively so ordinary payloads such as
+    `{"status": 503, ...}` or an object with a numeric `status` field are not mistaken for
+    HTTP responses. Reads `status_code` / `http_status`, and `status` only on objects that also
+    carry `headers` (e.g. `aiohttp.ClientResponse`).
+    """
+    if result is None or isinstance(result, (str, bytes, int, float, bool, list, tuple)):
+        return None
+
+    def _valid(val: Any) -> Optional[int]:
+        if isinstance(val, int) and not isinstance(val, bool) and 100 <= val <= 599:
+            return val
+        return None
+
+    if isinstance(result, dict):
+        for key in ("status_code", "http_status"):
+            found = _valid(result.get(key))
+            if found is not None:
+                return found
+        return None
+    for attr in ("status_code", "http_status"):
+        try:
+            found = _valid(getattr(result, attr, None))
+        except Exception:
+            found = None
+        if found is not None:
+            return found
+    try:
+        if getattr(result, "headers", None) is not None:
+            return _valid(getattr(result, "status", None))
+    except Exception:
+        pass
+    return None
+
+
 def _check_response_for_retryable_status(result: Any, retry_on_rate_limit: bool = True) -> None:
     """Turn retryable returned HTTP statuses into exceptions for the retry engine."""
-    status = extract_status_code(result)
+    status = _returned_http_status(result)
     if status == 429 and retry_on_rate_limit:
         raise HTTPRateLimitError(response=result)
     if status is not None and 500 <= status <= 599:
         raise HTTPStatus5xxError(status_code=status, response=result)
+
+
+def _attach_attempts(exc: BaseException, failures: List[AttemptFailure]) -> None:
+    """Attach the attempt history to an exception that is re-raised unchanged."""
+    for name in ("_llm_tally_attempts", "llm_tally_attempts"):
+        try:
+            setattr(exc, name, list(failures))
+        except Exception:
+            pass
 
 
 def execute_with_retry_sync(
@@ -427,11 +476,10 @@ def execute_with_retry_sync(
             )
             failures.append(failure)
 
-            if not should_retry:
-                try:
-                    setattr(exc, "_llm_tally_attempts", list(failures))
-                except Exception:
-                    pass
+            if not should_retry or (
+                attempt_num >= total_attempts and (cfg.raise_original or max_retries == 0)
+            ):
+                _attach_attempts(exc, failures)
                 raise
             if attempt_num >= total_attempts:
                 raise RetryExhaustedError(attempts=failures, func_name=func_name) from exc
@@ -497,11 +545,10 @@ async def execute_with_retry_async(
             )
             failures.append(failure)
 
-            if not should_retry:
-                try:
-                    setattr(exc, "_llm_tally_attempts", list(failures))
-                except Exception:
-                    pass
+            if not should_retry or (
+                attempt_num >= total_attempts and (cfg.raise_original or max_retries == 0)
+            ):
+                _attach_attempts(exc, failures)
                 raise
             if attempt_num >= total_attempts:
                 raise RetryExhaustedError(attempts=failures, func_name=func_name) from exc

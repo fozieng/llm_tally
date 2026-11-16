@@ -60,7 +60,7 @@ class CallRecord:
     function_name: str
     model: str
     config: Dict[str, Any]
-    status: str  # "success", "cached", "failed", "incomplete"
+    status: str  # "success", "cached", "failed", "incomplete", "streaming" (stream not finished yet)
     cache_hit: bool
     latency_ms: float
     input_tokens: int
@@ -77,6 +77,9 @@ class CallRecord:
     estimated_tokens: bool = False
     # Free-form per-call tags such as `user_id`, `tenant`, or `prompt_version`
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # True when the model has no known price (or no model could be determined), so `cost_usd`
+    # is 0 (or the configured `fallback_pricing` guess) rather than a real cost
+    unpriced: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -88,7 +91,7 @@ class CallRecord:
             timestamp=str(data.get("timestamp") or datetime.now(timezone.utc).isoformat()),
             feature=str(data.get("feature") or "default"),
             function_name=str(data.get("function_name") or "unknown"),
-            model=str(data.get("model") or "gpt-4o-mini"),
+            model=str(data.get("model") or "unknown"),
             config=dict(data.get("config") or {}),
             status=str(data.get("status") or "success"),
             cache_hit=bool(data.get("cache_hit", False)),
@@ -105,6 +108,7 @@ class CallRecord:
             cache_creation_input_tokens=int(data.get("cache_creation_input_tokens", 0)),
             estimated_tokens=bool(data.get("estimated_tokens", False)),
             metadata=dict(data.get("metadata") or {}),
+            unpriced=bool(data.get("unpriced", False)),
         )
 
 
@@ -185,20 +189,53 @@ def _extract_from_usage_obj(
     return None
 
 
+def _estimate_tokens_from_inputs(inputs: Any) -> int:
+    """Estimate prompt tokens from a name -> value mapping of call inputs (values only)."""
+    if isinstance(inputs, dict):
+        return sum(_estimate_tokens_from_text(v) for v in inputs.values())
+    return _estimate_tokens_from_text(inputs)
+
+
 def extract_token_usage(
     response: Any,
     args: Sequence[Any] = (),
     kwargs: Optional[Dict[str, Any]] = None,
+    inputs: Optional[Any] = None,
 ) -> TokenUsage:
     """
-    Extract input/output token counts from OpenAI, Anthropic (including `message_start`
-    stream events), Google Gemini, or dict responses.
-    Falls back to a lightweight character-based estimate if no structured usage metadata is present.
+    Extract input/output token counts from OpenAI (Chat Completions and Responses API, including
+    `response.completed` stream events), Anthropic (including `message_start` stream events),
+    Google Gemini (including thinking tokens), LangChain messages, or dict responses.
+    Falls back to a lightweight character-based estimate if no structured usage metadata is
+    present; the prompt is estimated from `inputs` (name -> value) when given, else from
+    `args` / `kwargs`.
     """
     detected_model: Optional[str] = None
     model_val = _get_attr_or_key(response, "model") or _get_attr_or_key(response, "model_version")
     if isinstance(model_val, str) and model_val.strip():
         detected_model = model_val.strip()
+    if detected_model is None:
+        # LangChain `AIMessage.response_metadata` carries `model_name` (OpenAI) or `model` (Anthropic)
+        resp_meta = _get_attr_or_key(response, "response_metadata")
+        if isinstance(resp_meta, dict):
+            lc_model = resp_meta.get("model_name") or resp_meta.get("model")
+            if isinstance(lc_model, str) and lc_model.strip():
+                detected_model = lc_model.strip()
+
+    # OpenAI Responses API stream events (`response.completed`, ...) wrap the full response
+    # object in `event.response`, which carries `usage` and `model`
+    nested_resp = (
+        _get_attr_or_key(response, "response")
+        if _get_attr_or_key(response, "usage") is None
+        else None
+    )
+    if nested_resp is not None and not isinstance(nested_resp, (str, bytes, int, float, bool, list)):
+        if _get_attr_or_key(nested_resp, "usage") is not None:
+            inner = extract_token_usage(nested_resp)
+            if not inner.estimated:
+                if detected_model and not inner.detected_model:
+                    inner.detected_model = detected_model
+                return inner
 
     # Check nested `response.message` (Anthropic `message_start` stream event carries `chunk.message.usage` and `chunk.message.model`)
     nested_msg = _get_attr_or_key(response, "message")
@@ -246,10 +283,13 @@ def extract_token_usage(
         if out_tok is None:
             out_tok = _get_attr_or_key(usage_meta, "output_tokens")
         cached_tok = _get_attr_or_key(usage_meta, "cached_content_token_count", 0)
+        # Gemini bills thinking tokens and tool-use prompt tokens on top of the visible counts
+        thoughts_tok = _get_attr_or_key(usage_meta, "thoughts_token_count", 0)
+        tool_prompt_tok = _get_attr_or_key(usage_meta, "tool_use_prompt_token_count", 0)
         if in_tok is not None or out_tok is not None:
             return TokenUsage(
-                input_tokens=int(in_tok or 0),
-                output_tokens=int(out_tok or 0),
+                input_tokens=int(in_tok or 0) + int(tool_prompt_tok or 0),
+                output_tokens=int(out_tok or 0) + int(thoughts_tok or 0),
                 cached_input_tokens=int(cached_tok or 0),
                 cache_creation_input_tokens=0,
                 estimated=False,
@@ -278,7 +318,11 @@ def extract_token_usage(
             )
 
     # 4. Heuristic estimation from input arguments & output response
-    est_in = _estimate_tokens_from_text({"args": args, "kwargs": kwargs or {}})
+    est_in = (
+        _estimate_tokens_from_inputs(inputs)
+        if inputs is not None
+        else _estimate_tokens_from_text({"args": args, "kwargs": kwargs or {}})
+    )
     est_out = _estimate_tokens_from_text(response)
     return TokenUsage(
         input_tokens=est_in,
@@ -359,6 +403,7 @@ class JSONLLogger:
       appended since the previous call.
     - Optional rotation: when the file would exceed `max_bytes`, it is renamed to
       `<name>.1` (older backups shift to `.2`, ... up to `backups`) and a new file is started.
+      `read_all(include_backups=True)` also returns the records kept in those backups.
     """
 
     def __init__(
@@ -468,6 +513,34 @@ class JSONLLogger:
         self._cache_file_key: Optional[Tuple[int, int]] = None
         self._cache_offset = 0
         self._cache_records: Dict[str, CallRecord] = {}
+        # Rotated backups never change after rotation: (st_dev, st_ino) -> (size, mtime_ns, records)
+        if not hasattr(self, "_backup_cache"):
+            self._backup_cache: Dict[Tuple[int, int], Tuple[int, int, Dict[str, CallRecord]]] = {}
+
+    def _read_backups_locked(self) -> Dict[str, CallRecord]:
+        """Return records from `<log>.N` ... `<log>.1` (oldest first), parsing each file once."""
+        merged: Dict[str, CallRecord] = {}
+        seen_keys = set()
+        for idx in range(self.backups, 0, -1):
+            path = f"{self.log_path}.{idx}"
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            seen_keys.add(key)
+            cached = self._backup_cache.get(key)
+            if cached is None or cached[0] != st.st_size or cached[1] != st.st_mtime_ns:
+                try:
+                    records = self._parse_bytes(_read_all_bytes_from_path(Path(path)))
+                except FileNotFoundError:
+                    continue
+                cached = (st.st_size, st.st_mtime_ns, records)
+                self._backup_cache[key] = cached
+            merged.update(cached[2])
+        for stale in set(self._backup_cache) - seen_keys:
+            del self._backup_cache[stale]
+        return merged
 
     @staticmethod
     def _parse_bytes(raw: bytes, into: Optional[Dict[str, CallRecord]] = None) -> Dict[str, CallRecord]:
@@ -483,49 +556,59 @@ class JSONLLogger:
             records[rec.id] = rec
         return records
 
-    def read_all(self, copy_records: bool = True) -> List[CallRecord]:
+    def read_all(self, copy_records: bool = True, include_backups: bool = False) -> List[CallRecord]:
         """
         Return all stored `CallRecord` entries (latest version per id, in first-seen order).
         Only bytes appended since the previous call are read and parsed. Pass
         `copy_records=False` for read-only internal use to skip copying.
+        With `include_backups=True`, records in rotated `<log>.1` ... `<log>.N` files come first.
         """
         with self._lock:
-            try:
-                fd = os.open(str(self.log_path), os.O_RDONLY)
-            except FileNotFoundError:
-                self._reset_cache()
-                return []
-            try:
-                self._flock(fd, _LOCK_SH)
-                st = os.fstat(fd)
-                file_key = (st.st_dev, st.st_ino)
-                if file_key != self._cache_file_key or st.st_size < self._cache_offset:
-                    self._reset_cache()
-                    self._cache_file_key = file_key
-                new_bytes = b""
-                if st.st_size > self._cache_offset:
-                    os.lseek(fd, self._cache_offset, os.SEEK_SET)
-                    new_bytes = _read_to_end(fd)
-            finally:
-                self._flock(fd, _LOCK_UN)
-                os.close(fd)
-
-            # Only consume complete lines; keep a trailing partial line for the next read
-            # unless it is valid JSON on its own (e.g. a file written without a final newline).
-            last_nl = new_bytes.rfind(b"\n")
-            complete = new_bytes[: last_nl + 1] if last_nl >= 0 else b""
-            tail = new_bytes[last_nl + 1 :]
-            if tail.strip():
-                try:
-                    json.loads(tail.decode("utf-8"))
-                    complete = new_bytes
-                except Exception:
-                    pass
-            self._cache_offset += len(complete)
-            self._parse_bytes(complete, into=self._cache_records)
-
-            records = list(self._cache_records.values())
+            current = self._read_current_locked()
+            if include_backups and self.backups > 0:
+                merged = self._read_backups_locked()
+                merged.update(current)
+                records = list(merged.values())
+            else:
+                records = list(current.values())
             return [_clone_record(r) for r in records] if copy_records else records
+
+    def _read_current_locked(self) -> Dict[str, CallRecord]:
+        """Incrementally parse the current log file; returns the internal id -> record cache."""
+        try:
+            fd = os.open(str(self.log_path), os.O_RDONLY)
+        except FileNotFoundError:
+            self._reset_cache()
+            return self._cache_records
+        try:
+            self._flock(fd, _LOCK_SH)
+            st = os.fstat(fd)
+            file_key = (st.st_dev, st.st_ino)
+            if file_key != self._cache_file_key or st.st_size < self._cache_offset:
+                self._reset_cache()
+                self._cache_file_key = file_key
+            new_bytes = b""
+            if st.st_size > self._cache_offset:
+                os.lseek(fd, self._cache_offset, os.SEEK_SET)
+                new_bytes = _read_to_end(fd)
+        finally:
+            self._flock(fd, _LOCK_UN)
+            os.close(fd)
+
+        # Only consume complete lines; keep a trailing partial line for the next read
+        # unless it is valid JSON on its own (e.g. a file written without a final newline).
+        last_nl = new_bytes.rfind(b"\n")
+        complete = new_bytes[: last_nl + 1] if last_nl >= 0 else b""
+        tail = new_bytes[last_nl + 1 :]
+        if tail.strip():
+            try:
+                json.loads(tail.decode("utf-8"))
+                complete = new_bytes
+            except Exception:
+                pass
+        self._cache_offset += len(complete)
+        self._parse_bytes(complete, into=self._cache_records)
+        return self._cache_records
 
     def clear(self) -> None:
         """Remove all records from the JSONL log file."""
@@ -588,20 +671,67 @@ def _percentile(sorted_vals: Sequence[float], pct: float) -> float:
     return float(sorted_vals[low] * (1.0 - weight) + sorted_vals[high] * weight)
 
 
+def reprice_records(records: Sequence[CallRecord], pricing: Any) -> List[CallRecord]:
+    """
+    Return `records` with every `unpriced` record whose model is now in `pricing` (a
+    `PricingRegistry`) re-priced from its stored token counts. Other records are returned as-is;
+    re-priced ones are copies, so cached records are never modified.
+    """
+    out: List[CallRecord] = []
+    for rec in records:
+        if rec.unpriced and rec.status not in ("cached", "failed"):
+            found = pricing.lookup(rec.model)
+            if found is not None:
+                clone = _clone_record(rec)
+                clone.cost_usd = found.compute_cost(
+                    input_tokens=rec.input_tokens,
+                    output_tokens=rec.output_tokens,
+                    cached_input_tokens=rec.cached_input_tokens,
+                    cache_creation_input_tokens=rec.cache_creation_input_tokens,
+                )
+                clone.unpriced = False
+                out.append(clone)
+                continue
+        out.append(rec)
+    return out
+
+
+def _timezone_label(tz: Any, at: datetime) -> str:
+    offset = at.astimezone(tz).utcoffset() or timedelta(0)
+    total_min = int(offset.total_seconds() // 60)
+    if total_min == 0:
+        return "UTC"
+    sign = "+" if total_min > 0 else "-"
+    hours, minutes = divmod(abs(total_min), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
 def analyze_logs(
     records: Sequence[CallRecord],
     now: Optional[datetime] = None,
+    recent_limit: int = 500,
 ) -> Dict[str, Any]:
     """
     Compute comprehensive cost, failure, and latency analytics across `records`.
 
     Answers:
     1. How much money did I spend this week? (`spend_summary` & `weekly_daily_spend`)
-    2. Which feature costs the most? (`feature_costs`)
+    2. Which feature costs the most? (`feature_totals`, and per config in `feature_costs`)
     3. Which calls fail the most? (`failure_stats`)
-    4. Which calls are slow? (`latency_stats` & `slowest_calls`)
+    4. Which calls are slow? (`latency_stats` & `slowest_calls`; cache hits and failed calls
+       are left out of latency figures when a group has live calls)
+
+    Days ("today", the 7-day chart) use the time zone of `now` when it is timezone-aware,
+    otherwise the local time zone of this machine. `recent_calls` holds the latest
+    `recent_limit` calls (`recent_calls_total` is the full count).
     """
-    reference_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if now is None:
+        reference_now = datetime.now(timezone.utc).astimezone()  # local time zone
+    elif now.tzinfo is None:
+        reference_now = now.replace(tzinfo=timezone.utc)
+    else:
+        reference_now = now
+    tz = reference_now.tzinfo
     today_start = reference_now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = today_start - timedelta(days=6)  # 7-day window including today
     month_ago = today_start - timedelta(days=29)
@@ -628,6 +758,8 @@ def analyze_logs(
 
     # Group by (feature, config_json) for "Which feature costs the most?"
     feature_groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # Total per feature across all configs (answers the headline question)
+    feature_totals_map: Dict[str, Dict[str, Any]] = {}
     # Group by (feature, function_name) for failures & latency
     call_groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -637,16 +769,21 @@ def analyze_logs(
     total_retries = 0
     estimated_calls = 0
     estimated_cost_usd = 0.0
+    unpriced_calls = 0
+    unpriced_models: Dict[str, int] = {}
     # metadata key -> metadata value -> {"cost": float, "calls": int}
     metadata_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for rec in records:
-        dt = _parse_iso_utc(rec.timestamp)
+        dt = _parse_iso_utc(rec.timestamp).astimezone(tz)
         cost = float(rec.cost_usd)
         spend_all_time += cost
         if rec.estimated_tokens:
             estimated_calls += 1
             estimated_cost_usd += cost
+        if rec.unpriced:
+            unpriced_calls += 1
+            unpriced_models[rec.model] = unpriced_models.get(rec.model, 0) + 1
         for meta_key, meta_val in (rec.metadata or {}).items():
             val_label = meta_val if isinstance(meta_val, str) else _safe_json_dumps(meta_val)
             bucket = metadata_groups.setdefault(str(meta_key), {}).setdefault(
@@ -676,10 +813,22 @@ def analyze_logs(
         if rec.status == "failed":
             total_failed += 1
         total_retries += int(rec.retries)
+        is_live = not rec.cache_hit and rec.status != "failed"
+
+        ft = feature_totals_map.setdefault(
+            rec.feature,
+            {"feature": rec.feature, "total_cost_usd": 0.0, "week_cost_usd": 0.0,
+             "total_calls": 0, "configs": 0},
+        )
+        ft["total_cost_usd"] += cost
+        if dt >= week_ago:
+            ft["week_cost_usd"] += cost
+        ft["total_calls"] += 1
 
         config_str = _safe_json_dumps(rec.config, sort_keys=True) if rec.config else "{}"
         f_key = (rec.feature, config_str)
         if f_key not in feature_groups:
+            ft["configs"] += 1
             feature_groups[f_key] = {
                 "feature": rec.feature,
                 "config": rec.config,
@@ -690,9 +839,11 @@ def analyze_logs(
                 "total_calls": 0,
                 "cached_calls": 0,
                 "failed_calls": 0,
+                "unpriced_calls": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "latencies_ms": [],
+                "live_latencies_ms": [],
             }
         fg = feature_groups[f_key]
         fg["models"].add(rec.model)
@@ -704,9 +855,13 @@ def analyze_logs(
             fg["cached_calls"] += 1
         if rec.status == "failed":
             fg["failed_calls"] += 1
+        if rec.unpriced:
+            fg["unpriced_calls"] += 1
         fg["input_tokens"] += rec.input_tokens
         fg["output_tokens"] += rec.output_tokens
         fg["latencies_ms"].append(rec.latency_ms)
+        if is_live:
+            fg["live_latencies_ms"].append(rec.latency_ms)
 
         c_key = (rec.feature, rec.function_name)
         if c_key not in call_groups:
@@ -718,7 +873,7 @@ def analyze_logs(
                 "failed_calls": 0,
                 "total_retries": 0,
                 "latencies_ms": [],
-                "non_cached_latencies_ms": [],
+                "live_latencies_ms": [],
                 "last_error": None,
                 "attempt_errors": [],
             }
@@ -727,14 +882,19 @@ def analyze_logs(
         cg["total_calls"] += 1
         cg["total_retries"] += int(rec.retries)
         cg["latencies_ms"].append(rec.latency_ms)
-        if not rec.cache_hit:
-            cg["non_cached_latencies_ms"].append(rec.latency_ms)
+        if is_live:
+            cg["live_latencies_ms"].append(rec.latency_ms)
         if rec.status == "failed":
             cg["failed_calls"] += 1
             if rec.error_message:
                 cg["last_error"] = rec.error_message
         if rec.attempt_errors:
             cg["attempt_errors"].extend(rec.attempt_errors)
+
+    def _latency_sample(group: Dict[str, Any]) -> List[float]:
+        # Live (non-cached, non-failed) calls show real model latency; cache hits would
+        # drag the average toward 0 and failed calls include retry back-off sleeps.
+        return sorted(group["live_latencies_ms"] or group["latencies_ms"])
 
     # Finalize Feature Cost Breakdown ("Which feature costs the most?")
     feature_costs: List[Dict[str, Any]] = []
@@ -747,7 +907,7 @@ def analyze_logs(
         share_pct = (
             (fg["total_cost_usd"] / spend_all_time * 100.0) if spend_all_time > 0 else 0.0
         )
-        lats = sorted(fg["latencies_ms"])
+        lats = _latency_sample(fg)
         feature_costs.append(
             {
                 "feature": fg["feature"],
@@ -760,6 +920,7 @@ def analyze_logs(
                 "total_calls": fg["total_calls"],
                 "cached_calls": fg["cached_calls"],
                 "failed_calls": fg["failed_calls"],
+                "unpriced_calls": fg["unpriced_calls"],
                 "avg_cost_usd": round(fg["total_cost_usd"] / max(1, fg["total_calls"]), 8),
                 "input_tokens": fg["input_tokens"],
                 "output_tokens": fg["output_tokens"],
@@ -767,6 +928,22 @@ def analyze_logs(
             }
         )
     feature_costs.sort(key=lambda x: (x["total_cost_usd"], x["total_calls"]), reverse=True)
+
+    feature_totals: List[Dict[str, Any]] = []
+    for ft in feature_totals_map.values():
+        feature_totals.append(
+            {
+                "feature": ft["feature"],
+                "total_cost_usd": round(ft["total_cost_usd"], 8),
+                "week_cost_usd": round(ft["week_cost_usd"], 8),
+                "share_pct": round(
+                    (ft["total_cost_usd"] / spend_all_time * 100.0) if spend_all_time > 0 else 0.0, 2
+                ),
+                "total_calls": ft["total_calls"],
+                "configs": ft["configs"],
+            }
+        )
+    feature_totals.sort(key=lambda x: (x["total_cost_usd"], x["total_calls"]), reverse=True)
 
     # Finalize Failure Breakdown ("Which calls fail the most?")
     failure_stats: List[Dict[str, Any]] = []
@@ -786,7 +963,7 @@ def analyze_logs(
             }
         )
 
-        lats = sorted(cg["latencies_ms"])
+        lats = _latency_sample(cg)
         avg_lat = sum(lats) / len(lats) if lats else 0.0
         p95_lat = _percentile(lats, 95.0)
         max_lat = lats[-1] if lats else 0.0
@@ -796,6 +973,7 @@ def analyze_logs(
                 "function_name": cg["function_name"],
                 "models": sorted(cg["models"]),
                 "total_calls": cg["total_calls"],
+                "live_calls": len(cg["live_latencies_ms"]),
                 "avg_latency_ms": round(avg_lat, 2),
                 "p95_latency_ms": round(p95_lat, 2),
                 "max_latency_ms": round(max_lat, 2),
@@ -811,13 +989,15 @@ def analyze_logs(
         reverse=True,
     )
 
-    # Top individual slowest calls
+    # Top individual slowest live calls
     slowest_calls = [
         rec.to_dict()
-        for rec in sorted(records, key=lambda r: r.latency_ms, reverse=True)[:15]
+        for rec in sorted(
+            (r for r in records if not r.cache_hit), key=lambda r: r.latency_ms, reverse=True
+        )[:15]
     ]
 
-    top_cost_feature = feature_costs[0]["feature"] if feature_costs else "N/A"
+    top_cost_feature = feature_totals[0]["feature"] if feature_totals else "N/A"
     most_failing = (
         f"{failure_stats[0]['feature']} ({failure_stats[0]['failed_calls']} failed)"
         if failure_stats and failure_stats[0]["failed_calls"] > 0
@@ -839,8 +1019,10 @@ def analyze_logs(
         rows.sort(key=lambda r: (r["total_cost_usd"], r["total_calls"]), reverse=True)
         metadata_costs[meta_key] = rows[:25]
 
+    recent_sorted = sorted(records, key=lambda r: _parse_iso_utc(r.timestamp), reverse=True)
     return {
         "generated_at": reference_now.isoformat(),
+        "timezone": _timezone_label(tz, reference_now),
         "metadata_costs": metadata_costs,
         "spend_summary": {
             "today_usd": round(spend_today, 8),
@@ -862,13 +1044,17 @@ def analyze_logs(
             "slowest_call": slowest_feature,
             "estimated_calls": estimated_calls,
             "estimated_cost_usd": round(estimated_cost_usd, 8),
+            "unpriced_calls": unpriced_calls,
+            "unpriced_models": dict(
+                sorted(unpriced_models.items(), key=lambda kv: kv[1], reverse=True)
+            ),
         },
         "weekly_daily_spend": list(daily_buckets.values()),
+        "feature_totals": feature_totals,
         "feature_costs": feature_costs,
         "failure_stats": failure_stats,
         "latency_stats": latency_stats,
         "slowest_calls": slowest_calls,
-        "recent_calls": [
-            rec.to_dict() for rec in sorted(records, key=lambda r: r.timestamp, reverse=True)[:250]
-        ],
+        "recent_calls": [rec.to_dict() for rec in recent_sorted[: max(0, int(recent_limit))]],
+        "recent_calls_total": total_calls,
     }
